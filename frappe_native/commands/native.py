@@ -598,8 +598,9 @@ def _build_summary(checks: list[dict]) -> dict[str, int]:
 
 def _status_line(check: dict) -> None:
 	label = check["status"].upper().ljust(4)
-	color = {"pass": "green", "warn": "yellow", "fail": "red"}[check["status"]]
-	click.secho(f"{label} {check['key']}: {check['message']}", fg=color)
+	color = {"pass": "green", "warn": 208, "fail": "red"}[check["status"]]
+	click.secho(label, fg=color, nl=False)
+	click.echo(f" {check['key']}: {check['message']}")
 	if check.get("fix"):
 		click.echo(f"     fix: {check['fix']}")
 
