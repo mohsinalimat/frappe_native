@@ -38,11 +38,15 @@ bench native doctor --app <your_app> --target android
 bench native run --app <your_app> --target android --variant debug
 ```
 
-This creates a standalone local start page inside the APK:
+This creates a standalone local source app:
 
-`apps/<your_app>/mobile/android/app/src/main/assets/frappe_native/index.html`
+`apps/<your_app>/mobile/app/index.html`
 
-Edit that file to customize what the app shows at launch.
+Optional files:
+- `apps/<your_app>/mobile/app/styles.css`
+- `apps/<your_app>/mobile/app/app.js`
+
+`bench native build` and `bench native run` automatically sync `mobile/app/*` into Android assets before compiling.
 
 ## Command Reference
 

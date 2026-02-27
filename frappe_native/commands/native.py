@@ -93,6 +93,7 @@ def init_native_project(
 			target.write_text(content, encoding="utf-8")
 			created.append(str(relative_path))
 
+	synced_files = _sync_mobile_web_source(app_path=app_path, android_root=android_root)
 	setup_notes = _post_init_android_setup(android_root=android_root, force=force)
 
 	click.secho("Native Android MVP scaffold completed.", fg="green")
@@ -114,6 +115,10 @@ def init_native_project(
 		click.echo("\nSetup notes:")
 		for note in setup_notes:
 			click.echo(f"  - {note}")
+	if synced_files:
+		click.echo("\nSynced mobile source files:")
+		for path in synced_files:
+			click.echo(f"  -> {path}")
 
 	click.echo("\nNext steps:")
 	click.echo(f"  bench native doctor --app {app_name} --target android")
@@ -231,13 +236,40 @@ def doctor_native_project(
 			),
 		)
 
-	asset_index = android_root / "app" / "src" / "main" / "assets" / "frappe_native" / "index.html"
+	mobile_source_root = _mobile_source_root(app_path)
+	source_index = mobile_source_root / "index.html"
+	_add_check(
+		checks,
+		key="mobile.source_dir",
+		status="pass" if mobile_source_root.exists() else "fail",
+		message=f"Mobile source dir {'found' if mobile_source_root.exists() else 'missing'}: {mobile_source_root}",
+		fix=(
+			None
+			if mobile_source_root.exists()
+			else f"Run: bench native init --app {app_name} --platform android --force"
+		),
+	)
+	_add_check(
+		checks,
+		key="mobile.source_index",
+		status="pass" if source_index.exists() else "fail",
+		message=f"Editable index.html {'found' if source_index.exists() else 'missing'}: {source_index}",
+		fix=(
+			None
+			if source_index.exists()
+			else f"Run: bench native init --app {app_name} --platform android --force"
+		),
+	)
+
+	asset_index = _android_asset_root(android_root) / "index.html"
 	_add_check(
 		checks,
 		key="android.start_page_file",
-		status="pass" if asset_index.exists() else "fail",
-		message=f"Standalone page {'found' if asset_index.exists() else 'missing'}: {asset_index}",
-		fix=None if asset_index.exists() else "Re-run init --force to generate default standalone page",
+		status="pass" if asset_index.exists() else "warn",
+		message=f"Android asset index.html {'found' if asset_index.exists() else 'missing'}: {asset_index}",
+		fix=None
+		if asset_index.exists()
+		else f"Run: bench native build --app {app_name} --target android --variant debug (syncs source to assets)",
 	)
 
 	gradlew_path = android_root / "gradlew"
@@ -411,9 +443,9 @@ def build_native_project(
 	if target != "android":
 		raise click.ClickException("Only Android builds are supported right now.")
 
-	_, _, android_root = _resolve_android_paths(app_name)
+	_, app_path, android_root = _resolve_android_paths(app_name)
 	gradle_task, apk_paths = _build_android_variant(
-		android_root=android_root, app_name=app_name, variant=variant, verbose=not json_output
+		app_path=app_path, android_root=android_root, app_name=app_name, variant=variant, verbose=not json_output
 	)
 
 	installed_apk_path = None
@@ -491,9 +523,9 @@ def run_native_project(
 	if variant != "debug":
 		raise click.ClickException("`bench native run` currently supports only --variant debug.")
 
-	_, _, android_root = _resolve_android_paths(app_name)
+	_, app_path, android_root = _resolve_android_paths(app_name)
 	gradle_task, apk_paths = _build_android_variant(
-		android_root=android_root, app_name=app_name, variant=variant, verbose=not json_output
+		app_path=app_path, android_root=android_root, app_name=app_name, variant=variant, verbose=not json_output
 	)
 
 	if not apk_paths:
@@ -732,6 +764,33 @@ def _check_adb(checks: list[dict], sdk_path: Path) -> None:
 	)
 
 
+def _mobile_source_root(app_path: Path) -> Path:
+	return app_path / "mobile" / "app"
+
+
+def _android_asset_root(android_root: Path) -> Path:
+	return android_root / "app" / "src" / "main" / "assets" / "frappe_native"
+
+
+def _sync_mobile_web_source(app_path: Path, android_root: Path) -> list[str]:
+	source_root = _mobile_source_root(app_path)
+	if not source_root.exists():
+		return []
+
+	asset_root = _android_asset_root(android_root)
+	asset_root.mkdir(parents=True, exist_ok=True)
+	synced: list[str] = []
+
+	for source in sorted(path for path in source_root.rglob("*") if path.is_file()):
+		relative = source.relative_to(source_root)
+		target = asset_root / relative
+		target.parent.mkdir(parents=True, exist_ok=True)
+		shutil.copy2(source, target)
+		synced.append(str(relative))
+
+	return synced
+
+
 def _resolve_android_paths(app_name: str) -> tuple[Path, Path, Path]:
 	bench_path = Path(frappe.utils.get_bench_path())
 	app_path = bench_path / "apps" / app_name
@@ -779,12 +838,13 @@ def _ensure_gradle_wrapper(android_root: Path) -> list[str]:
 
 
 def _build_android_variant(
-	android_root: Path, app_name: str, variant: str, verbose: bool = True
+	app_path: Path, android_root: Path, app_name: str, variant: str, verbose: bool = True
 ) -> tuple[str, list[Path]]:
+	_sync_mobile_web_source(app_path=app_path, android_root=android_root)
 	gradlew_cmd = _ensure_gradle_wrapper(android_root)
 	gradle_task = f"assemble{variant.capitalize()}"
 	if verbose:
-		click.echo(f"Running {gradle_task} for '{app_name}' ...")
+		click.echo(f"Running {gradle_task} for '{app_name}' (after syncing mobile/app -> android assets) ...")
 
 	build_ok, build_message = _run_gradle_task(android_root, gradlew_cmd, gradle_task)
 	if not build_ok:
@@ -1020,9 +1080,9 @@ def _get_android_mvp_templates(
 		Path("mobile/android/app/src/main/res/values/strings.xml"): _strings_template(
 			display_name=display_name
 		),
-		Path("mobile/android/app/src/main/assets/frappe_native/index.html"): _standalone_index_template(
-			display_name=display_name, app_name=app_name
-		),
+		Path("mobile/app/index.html"): _standalone_index_template(display_name=display_name, app_name=app_name),
+		Path("mobile/app/styles.css"): _standalone_styles_template(),
+		Path("mobile/app/app.js"): _standalone_app_js_template(app_name=app_name),
 		main_activity_path: _main_activity_template(package_id=package_id),
 		native_bridge_path: _native_bridge_template(package_id=package_id),
 		Path("mobile/shared/config/environments.json"): _environments_template(),
@@ -1218,65 +1278,7 @@ def _standalone_index_template(display_name: str, app_name: str) -> str:
 	<meta charset="utf-8" />
 	<meta name="viewport" content="width=device-width, initial-scale=1" />
 	<title>{display_name}</title>
-	<style>
-		:root {{
-			--bg: #f7f8fb;
-			--card: #ffffff;
-			--text: #15212e;
-			--muted: #5a6777;
-			--accent: #0078d4;
-			--border: #dde3ea;
-		}}
-		* {{ box-sizing: border-box; }}
-		body {{
-			margin: 0;
-			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-			background: radial-gradient(circle at top right, #e8f2ff 0%, var(--bg) 45%);
-			color: var(--text);
-			min-height: 100vh;
-			display: grid;
-			place-items: center;
-			padding: 24px;
-		}}
-		.card {{
-			width: min(720px, 100%);
-			background: var(--card);
-			border: 1px solid var(--border);
-			border-radius: 18px;
-			padding: 28px;
-			box-shadow: 0 10px 30px rgba(13, 23, 34, 0.08);
-		}}
-		h1 {{
-			margin: 0 0 12px;
-			font-size: 30px;
-			letter-spacing: -0.02em;
-		}}
-		p {{
-			margin: 0 0 12px;
-			line-height: 1.55;
-			color: var(--muted);
-		}}
-		.badge {{
-			display: inline-block;
-			padding: 6px 10px;
-			border-radius: 999px;
-			background: #e9f3ff;
-			color: var(--accent);
-			font-weight: 600;
-			font-size: 12px;
-			margin-bottom: 16px;
-		}}
-		.code {{
-			font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-			background: #f3f6fa;
-			border: 1px solid var(--border);
-			padding: 10px 12px;
-			border-radius: 10px;
-			color: #2b3440;
-			font-size: 13px;
-			overflow-x: auto;
-		}}
-	</style>
+	<link rel="stylesheet" href="./styles.css" />
 </head>
 <body>
 	<main class="card">
@@ -1285,10 +1287,103 @@ def _standalone_index_template(display_name: str, app_name: str) -> str:
 		<p>This is the default standalone start page bundled inside your APK.</p>
 		<p>App: <strong>{display_name}</strong> (<code>{app_name}</code>)</p>
 		<p>You can replace this file with Vue, React, or plain HTML/CSS/JS without requiring a live site URL.</p>
-		<div class="code">app/src/main/assets/frappe_native/index.html</div>
+		<p>Edit source files in:</p>
+		<div class="code">apps/{app_name}/mobile/app/</div>
+		<div class="status" id="bridge-status">Checking NativeBridge...</div>
 	</main>
+	<script src="./app.js"></script>
 </body>
 </html>
+"""
+
+
+def _standalone_styles_template() -> str:
+	return """:root {
+	--bg: #f7f8fb;
+	--card: #ffffff;
+	--text: #15212e;
+	--muted: #5a6777;
+	--accent: #0078d4;
+	--border: #dde3ea;
+}
+* { box-sizing: border-box; }
+body {
+	margin: 0;
+	font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+	background: radial-gradient(circle at top right, #e8f2ff 0%, var(--bg) 45%);
+	color: var(--text);
+	min-height: 100vh;
+	display: grid;
+	place-items: center;
+	padding: 24px;
+}
+.card {
+	width: min(720px, 100%);
+	background: var(--card);
+	border: 1px solid var(--border);
+	border-radius: 18px;
+	padding: 28px;
+	box-shadow: 0 10px 30px rgba(13, 23, 34, 0.08);
+}
+h1 {
+	margin: 0 0 12px;
+	font-size: 30px;
+	letter-spacing: -0.02em;
+}
+p {
+	margin: 0 0 12px;
+	line-height: 1.55;
+	color: var(--muted);
+}
+.badge {
+	display: inline-block;
+	padding: 6px 10px;
+	border-radius: 999px;
+	background: #e9f3ff;
+	color: var(--accent);
+	font-weight: 600;
+	font-size: 12px;
+	margin-bottom: 16px;
+}
+.code {
+	font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+	background: #f3f6fa;
+	border: 1px solid var(--border);
+	padding: 10px 12px;
+	border-radius: 10px;
+	color: #2b3440;
+	font-size: 13px;
+	overflow-x: auto;
+	margin-bottom: 12px;
+}
+.status {
+	margin-top: 8px;
+	padding: 10px 12px;
+	border-radius: 10px;
+	background: #f4f6f8;
+	border: 1px solid var(--border);
+	color: #2b3440;
+	font-size: 13px;
+}
+"""
+
+
+def _standalone_app_js_template(app_name: str) -> str:
+	return f"""(function () {{
+	const el = document.getElementById("bridge-status");
+	if (!el) return;
+
+	if (window.NativeBridge && typeof window.NativeBridge.getDeviceInfo === "function") {{
+		try {{
+			const deviceInfo = JSON.parse(window.NativeBridge.getDeviceInfo());
+			el.textContent = "NativeBridge connected (" + (deviceInfo.platform || "android") + ")";
+		}} catch (error) {{
+			el.textContent = "NativeBridge available, but device info parse failed";
+		}}
+	}} else {{
+		el.textContent = "NativeBridge not available (web preview mode)";
+	}}
+}})();
 """
 
 
@@ -1349,7 +1444,7 @@ class MainActivity : AppCompatActivity() {{
 			"<h2>Unable to load app</h2>" +
 			"<p>" + safeMessage + "</p>" +
 			"<p>Current page: <code>" + startPage + "</code></p>" +
-			"<p>Edit <code>app/src/main/assets/frappe_native/index.html</code> to customize this app screen.</p>" +
+			"<p>Edit <code>mobile/app/index.html</code>, then run <code>bench native build</code> to sync and rebuild.</p>" +
 			"</body></html>"
 		webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
 	}}
@@ -1477,7 +1572,13 @@ Install Android Studio / Android SDK and ensure `gradle` is available.
 
 Edit your standalone start page:
 
-`mobile/android/app/src/main/assets/frappe_native/index.html`
+`mobile/app/index.html`
+
+Optional supporting files:
+
+`mobile/app/styles.css`
+
+`mobile/app/app.js`
 
 ## 2) Run doctor checks
 
