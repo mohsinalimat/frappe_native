@@ -117,12 +117,7 @@ def init_native_project(
 
 	click.echo("\nNext steps:")
 	click.echo(f"  bench native doctor --app {app_name} --target android")
-	click.echo(f"  cd {android_root}")
-	if (android_root / "gradlew").exists():
-		click.echo("  ./gradlew assembleDebug")
-	else:
-		click.echo("  gradle wrapper --gradle-version 8.7")
-		click.echo("  ./gradlew assembleDebug")
+	click.echo(f"  bench native build --app {app_name} --target android --variant debug")
 	click.echo(f"  cat apps/{app_name}/docs/mobile-quickstart.md")
 
 
@@ -387,6 +382,118 @@ def doctor_native_project(
 		sys.exit(1)
 
 
+@native.command("build", help="Build Android APK for an app.")
+@click.option("--app", "app_name", required=True, help="Frappe app name under apps/.")
+@click.option(
+	"--target",
+	type=click.Choice(["android"], case_sensitive=False),
+	default="android",
+	show_default=True,
+	help="Native target to build.",
+)
+@click.option(
+	"--variant",
+	type=click.Choice(["debug", "release"], case_sensitive=False),
+	default="debug",
+	show_default=True,
+	help="Android build variant.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON output.")
+def build_native_project(
+	app_name: str,
+	target: str,
+	variant: str,
+	json_output: bool = False,
+):
+	if target != "android":
+		raise click.ClickException("Only Android builds are supported right now.")
+
+	bench_path = Path(frappe.utils.get_bench_path())
+	app_path = bench_path / "apps" / app_name
+	android_root = app_path / "mobile" / "android"
+
+	if not app_path.exists():
+		raise click.ClickException(f"App '{app_name}' was not found at {app_path}.")
+	if not android_root.exists():
+		raise click.ClickException(
+			f"Android scaffold not found at {android_root}. Run `bench native init --app {app_name} --platform android` first."
+		)
+
+	gradlew_cmd = _get_gradle_wrapper_cmd(android_root)
+	if gradlew_cmd is None:
+		gradle_bin = shutil.which("gradle")
+		if not gradle_bin:
+			raise click.ClickException(
+				"Gradle wrapper is missing and `gradle` is not in PATH. "
+				f"Run `cd {android_root} && gradle wrapper --gradle-version 8.7` first."
+			)
+		try:
+			subprocess.run(
+				[gradle_bin, "wrapper", "--gradle-version", "8.7"],
+				cwd=android_root,
+				check=True,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+				text=True,
+			)
+		except subprocess.CalledProcessError as error:
+			last_line = _last_non_empty_line(error.stderr) or _last_non_empty_line(error.stdout)
+			raise click.ClickException(
+				f"Failed to generate Gradle wrapper automatically: {last_line or 'unknown error'}"
+			) from error
+
+		gradlew_cmd = _get_gradle_wrapper_cmd(android_root)
+		if gradlew_cmd is None:
+			raise click.ClickException("Gradle wrapper generation completed but wrapper executable was not found.")
+
+	gradle_task = f"assemble{variant.capitalize()}"
+	click.echo(f"Running {gradle_task} for '{app_name}' ...")
+
+	build_ok, build_message = _run_gradle_task(android_root, gradlew_cmd, gradle_task)
+	if not build_ok:
+		if json_output:
+			click.echo(
+				json.dumps(
+					{
+						"app": app_name,
+						"target": target,
+						"variant": variant,
+						"ok": False,
+						"error": build_message,
+					},
+					indent=2,
+				)
+			)
+		raise click.ClickException(build_message)
+
+	apk_paths = _find_apk_outputs(android_root, variant)
+	if json_output:
+		click.echo(
+			json.dumps(
+				{
+					"app": app_name,
+					"target": target,
+					"variant": variant,
+					"ok": True,
+					"task": gradle_task,
+					"apk_paths": [str(path) for path in apk_paths],
+				},
+				indent=2,
+			)
+		)
+		return
+
+	click.secho("Build completed successfully.", fg="green")
+	if apk_paths:
+		click.echo("APK output:")
+		for apk_path in apk_paths:
+			click.echo(f"  {apk_path}")
+	else:
+		click.echo(
+			f"Build succeeded but no APK found under {android_root / 'app' / 'build' / 'outputs' / 'apk' / variant}"
+		)
+
+
 def _add_check(
 	checks: list[dict],
 	key: str,
@@ -565,10 +672,18 @@ def _check_adb(checks: list[dict], sdk_path: Path) -> None:
 	)
 
 
-def _run_gradle_assemble(android_root: Path) -> tuple[bool, str]:
+def _get_gradle_wrapper_cmd(android_root: Path) -> list[str] | None:
+	if os.name == "nt":
+		gradlew = android_root / "gradlew.bat"
+		return [str(gradlew)] if gradlew.exists() else None
+	gradlew = android_root / "gradlew"
+	return ["./gradlew"] if gradlew.exists() else None
+
+
+def _run_gradle_task(android_root: Path, gradlew_cmd: list[str], task: str) -> tuple[bool, str]:
 	try:
 		proc = subprocess.run(
-			["./gradlew", "assembleDebug"],
+			[*gradlew_cmd, task],
 			cwd=android_root,
 			check=False,
 			stdout=subprocess.PIPE,
@@ -586,6 +701,20 @@ def _run_gradle_assemble(android_root: Path) -> tuple[bool, str]:
 
 	error_line = _last_non_empty_line(proc.stderr) or _last_non_empty_line(proc.stdout)
 	return False, error_line or "Build failed"
+
+
+def _find_apk_outputs(android_root: Path, variant: str) -> list[Path]:
+	apk_dir = android_root / "app" / "build" / "outputs" / "apk" / variant
+	if not apk_dir.exists():
+		return []
+	return sorted(path for path in apk_dir.glob("*.apk") if path.is_file())
+
+
+def _run_gradle_assemble(android_root: Path) -> tuple[bool, str]:
+	gradlew_cmd = _get_gradle_wrapper_cmd(android_root)
+	if gradlew_cmd is None:
+		return False, "Gradle wrapper not found"
+	return _run_gradle_task(android_root, gradlew_cmd, "assembleDebug")
 
 
 def _build_summary(checks: list[dict]) -> dict[str, int]:
@@ -1170,13 +1299,13 @@ bench native doctor --app {app_name} --target android
 ## 3) Build debug APK
 
 ```bash
-cd apps/{app_name}/mobile/android
-./gradlew assembleDebug
+bench native build --app {app_name} --target android --variant debug
 ```
 
-If `./gradlew` is missing:
+If you still prefer manual Gradle:
 
 ```bash
+cd apps/{app_name}/mobile/android
 gradle wrapper --gradle-version 8.7
 ./gradlew assembleDebug
 ```
