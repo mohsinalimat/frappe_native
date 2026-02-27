@@ -412,14 +412,22 @@ def _main_activity_template(package_id: str) -> str:
 	return f"""package {package_id}
 
 import android.annotation.SuppressLint
+import android.graphics.Color
+import android.net.http.SslError
 import android.os.Bundle
+import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceError
+import android.webkit.WebResourceRequest
+import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {{
 	private lateinit var webView: WebView
+	// Update this to your reachable Frappe URL (for phone, use laptop LAN IP).
+	private val startUrl = "http://192.168.1.108:8000"
 
 	@SuppressLint("SetJavaScriptEnabled")
 	override fun onCreate(savedInstanceState: Bundle?) {{
@@ -429,14 +437,48 @@ class MainActivity : AppCompatActivity() {{
 		webView = findViewById(R.id.web_view)
 		webView.settings.javaScriptEnabled = true
 		webView.settings.domStorageEnabled = true
-		webView.webViewClient = WebViewClient()
+		webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+		webView.setBackgroundColor(Color.WHITE)
+		webView.webViewClient = object : WebViewClient() {{
+			override fun onReceivedError(
+				view: WebView?,
+				request: WebResourceRequest?,
+				error: WebResourceError?,
+			) {{
+				if (request?.isForMainFrame == true) {{
+					showErrorPage("WebView load error: ${{error?.description ?: "unknown"}}")
+				}}
+			}}
+
+			override fun onReceivedSslError(
+				view: WebView?,
+				handler: SslErrorHandler?,
+				error: SslError?,
+			) {{
+				handler?.cancel()
+				showErrorPage("SSL error while opening $startUrl")
+			}}
+		}}
 		webView.webChromeClient = WebChromeClient()
 
 		// Exposes Android-native methods to JS as `window.NativeBridge`.
 		webView.addJavascriptInterface(NativeBridge(this), "NativeBridge")
 
-		// Replace with env-based configuration in a later step.
-		webView.loadUrl("https://example.com")
+		webView.loadUrl(startUrl)
+	}}
+
+	private fun showErrorPage(message: String) {{
+		val safeMessage = message
+			.replace("&", "&amp;")
+			.replace("<", "&lt;")
+			.replace(">", "&gt;")
+		val html = "<html><body style=\\"font-family: sans-serif; padding: 20px; background: #ffffff; color: #222222;\\">" +
+			"<h2>Unable to load app</h2>" +
+			"<p>" + safeMessage + "</p>" +
+			"<p>Current URL: <code>" + startUrl + "</code></p>" +
+			"<p>Edit <code>MainActivity.kt</code> and set <code>startUrl</code> to your Frappe site URL.</p>" +
+			"</body></html>"
+		webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
 	}}
 }}
 """
@@ -559,6 +601,8 @@ This project scaffold was generated for app: `{app_name}`.
 ## 1) Prepare Android tooling
 
 Install Android Studio / Android SDK and ensure `gradle` is available.
+
+Set your startup URL in `mobile/android/app/src/main/java/.../MainActivity.kt` (`startUrl`).
 
 ## 2) Build debug APK
 
