@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
 
 import click
@@ -50,8 +53,7 @@ def init_native_project(
 		if not site_path.exists():
 			raise click.ClickException(f"Site '{site}' was not found at {site_path}.")
 
-	mobile_root = app_path / "mobile"
-	android_root = mobile_root / "android"
+	android_root = app_path / "mobile" / "android"
 	if android_root.exists() and not force:
 		raise click.ClickException(
 			f"Target already exists: {android_root}. Use --force to overwrite generated files."
@@ -89,6 +91,8 @@ def init_native_project(
 			target.write_text(content, encoding="utf-8")
 			created.append(str(relative_path))
 
+	setup_notes = _post_init_android_setup(android_root=android_root, force=force)
+
 	click.secho("Native Android MVP scaffold completed.", fg="green")
 	click.echo(f"App: {app_name}")
 	click.echo(f"Package ID: {package_id}")
@@ -104,11 +108,72 @@ def init_native_project(
 		for path in updated:
 			click.echo(f"  ~ {path}")
 
+	if setup_notes:
+		click.echo("\nSetup notes:")
+		for note in setup_notes:
+			click.echo(f"  - {note}")
+
 	click.echo("\nNext steps:")
-	click.echo(f"  cd apps/{app_name}/mobile/android")
-	click.echo("  gradle wrapper")
-	click.echo("  gradle assembleDebug")
+	click.echo(f"  cd {android_root}")
+	if (android_root / "gradlew").exists():
+		click.echo("  ./gradlew assembleDebug")
+	else:
+		click.echo("  gradle wrapper --gradle-version 8.7")
+		click.echo("  ./gradlew assembleDebug")
 	click.echo(f"  cat apps/{app_name}/docs/mobile-quickstart.md")
+
+
+def _post_init_android_setup(android_root: Path, force: bool) -> list[str]:
+	notes = []
+	sdk_dir = os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+	local_properties = android_root / "local.properties"
+
+	if sdk_dir and (force or not local_properties.exists()):
+		local_properties.write_text(f"sdk.dir={_escape_local_properties_path(sdk_dir)}\n", encoding="utf-8")
+		notes.append(f"Wrote local.properties from SDK env: {sdk_dir}")
+	elif sdk_dir:
+		notes.append("Kept existing local.properties")
+	else:
+		notes.append("ANDROID_SDK_ROOT/ANDROID_HOME not set; set sdk.dir manually in local.properties")
+
+	gradle_bin = shutil.which("gradle")
+	gradlew = android_root / "gradlew"
+	if gradle_bin and not gradlew.exists():
+		try:
+			subprocess.run(
+				[gradle_bin, "wrapper", "--gradle-version", "8.7"],
+				cwd=android_root,
+				check=True,
+				timeout=60,
+				stdout=subprocess.PIPE,
+				stderr=subprocess.PIPE,
+				text=True,
+			)
+			notes.append("Generated Gradle wrapper: ./gradlew")
+		except subprocess.CalledProcessError as error:
+			last_line = _last_non_empty_line(error.stderr) or _last_non_empty_line(error.stdout)
+			notes.append(
+				f"Could not generate Gradle wrapper automatically ({last_line or 'unknown error'})."
+			)
+		except subprocess.TimeoutExpired:
+			notes.append("Timed out while generating wrapper; run `gradle wrapper --gradle-version 8.7` manually")
+	elif gradle_bin:
+		notes.append("Gradle wrapper already present: ./gradlew")
+	else:
+		notes.append("Gradle not found in PATH; install Gradle 8.x to generate wrapper")
+
+	return notes
+
+
+def _last_non_empty_line(value: str | None) -> str:
+	if not value:
+		return ""
+	lines = [line.strip() for line in value.splitlines() if line.strip()]
+	return lines[-1] if lines else ""
+
+
+def _escape_local_properties_path(path: str) -> str:
+	return path.replace("\\", "\\\\")
 
 
 def _sanitize_identifier(value: str) -> str:
@@ -165,7 +230,25 @@ def _get_android_mvp_templates(
 
 
 def _settings_gradle_template(app_name: str) -> str:
-	return f"""rootProject.name = "{app_name}_android"
+	return f"""import org.gradle.api.initialization.resolve.RepositoriesMode
+
+pluginManagement {{
+	repositories {{
+		google()
+		mavenCentral()
+		gradlePluginPortal()
+	}}
+}}
+
+dependencyResolutionManagement {{
+	repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+	repositories {{
+		google()
+		mavenCentral()
+	}}
+}}
+
+rootProject.name = "{app_name}_android"
 include(":app")
 """
 
@@ -212,7 +295,7 @@ bench native init --app {app_name} --platform android
 If `gradlew` is missing, open this folder in Android Studio once, or run:
 
 ```bash
-gradle wrapper
+gradle wrapper --gradle-version 8.7
 ```
 """
 
@@ -481,7 +564,13 @@ Install Android Studio / Android SDK and ensure `gradle` is available.
 
 ```bash
 cd apps/{app_name}/mobile/android
-gradle wrapper
-gradle assembleDebug
+./gradlew assembleDebug
+```
+
+If `./gradlew` is missing:
+
+```bash
+gradle wrapper --gradle-version 8.7
+./gradlew assembleDebug
 ```
 """
