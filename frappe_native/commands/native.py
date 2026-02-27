@@ -220,6 +220,9 @@ def _get_android_mvp_templates(
 		Path("mobile/android/app/src/main/res/values/strings.xml"): _strings_template(
 			display_name=display_name
 		),
+		Path("mobile/android/app/src/main/assets/frappe_native/index.html"): _standalone_index_template(
+			display_name=display_name, app_name=app_name
+		),
 		main_activity_path: _main_activity_template(package_id=package_id),
 		native_bridge_path: _native_bridge_template(package_id=package_id),
 		Path("mobile/shared/config/environments.json"): _environments_template(),
@@ -408,14 +411,93 @@ def _strings_template(display_name: str) -> str:
 """
 
 
+def _standalone_index_template(display_name: str, app_name: str) -> str:
+	return f"""<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>{display_name}</title>
+	<style>
+		:root {{
+			--bg: #f7f8fb;
+			--card: #ffffff;
+			--text: #15212e;
+			--muted: #5a6777;
+			--accent: #0078d4;
+			--border: #dde3ea;
+		}}
+		* {{ box-sizing: border-box; }}
+		body {{
+			margin: 0;
+			font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+			background: radial-gradient(circle at top right, #e8f2ff 0%, var(--bg) 45%);
+			color: var(--text);
+			min-height: 100vh;
+			display: grid;
+			place-items: center;
+			padding: 24px;
+		}}
+		.card {{
+			width: min(720px, 100%);
+			background: var(--card);
+			border: 1px solid var(--border);
+			border-radius: 18px;
+			padding: 28px;
+			box-shadow: 0 10px 30px rgba(13, 23, 34, 0.08);
+		}}
+		h1 {{
+			margin: 0 0 12px;
+			font-size: 30px;
+			letter-spacing: -0.02em;
+		}}
+		p {{
+			margin: 0 0 12px;
+			line-height: 1.55;
+			color: var(--muted);
+		}}
+		.badge {{
+			display: inline-block;
+			padding: 6px 10px;
+			border-radius: 999px;
+			background: #e9f3ff;
+			color: var(--accent);
+			font-weight: 600;
+			font-size: 12px;
+			margin-bottom: 16px;
+		}}
+		.code {{
+			font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+			background: #f3f6fa;
+			border: 1px solid var(--border);
+			padding: 10px 12px;
+			border-radius: 10px;
+			color: #2b3440;
+			font-size: 13px;
+			overflow-x: auto;
+		}}
+	</style>
+</head>
+<body>
+	<main class="card">
+		<div class="badge">Standalone APK Screen</div>
+		<h1>Welcome to Frappe Native</h1>
+		<p>This is the default standalone start page bundled inside your APK.</p>
+		<p>App: <strong>{display_name}</strong> (<code>{app_name}</code>)</p>
+		<p>You can replace this file with Vue, React, or plain HTML/CSS/JS without requiring a live site URL.</p>
+		<div class="code">app/src/main/assets/frappe_native/index.html</div>
+	</main>
+</body>
+</html>
+"""
+
+
 def _main_activity_template(package_id: str) -> str:
 	return f"""package {package_id}
 
 import android.annotation.SuppressLint
 import android.graphics.Color
-import android.net.http.SslError
 import android.os.Bundle
-import android.webkit.SslErrorHandler
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -426,8 +508,7 @@ import androidx.appcompat.app.AppCompatActivity
 
 class MainActivity : AppCompatActivity() {{
 	private lateinit var webView: WebView
-	// Update this to your reachable Frappe URL (for phone, use laptop LAN IP).
-	private val startUrl = "http://192.168.1.108:8000"
+	private val startPage = "file:///android_asset/frappe_native/index.html"
 
 	@SuppressLint("SetJavaScriptEnabled")
 	override fun onCreate(savedInstanceState: Bundle?) {{
@@ -438,6 +519,7 @@ class MainActivity : AppCompatActivity() {{
 		webView.settings.javaScriptEnabled = true
 		webView.settings.domStorageEnabled = true
 		webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
+		webView.settings.allowFileAccess = true
 		webView.setBackgroundColor(Color.WHITE)
 		webView.webViewClient = object : WebViewClient() {{
 			override fun onReceivedError(
@@ -449,22 +531,13 @@ class MainActivity : AppCompatActivity() {{
 					showErrorPage("WebView load error: ${{error?.description ?: "unknown"}}")
 				}}
 			}}
-
-			override fun onReceivedSslError(
-				view: WebView?,
-				handler: SslErrorHandler?,
-				error: SslError?,
-			) {{
-				handler?.cancel()
-				showErrorPage("SSL error while opening $startUrl")
-			}}
 		}}
 		webView.webChromeClient = WebChromeClient()
 
 		// Exposes Android-native methods to JS as `window.NativeBridge`.
 		webView.addJavascriptInterface(NativeBridge(this), "NativeBridge")
 
-		webView.loadUrl(startUrl)
+		webView.loadUrl(startPage)
 	}}
 
 	private fun showErrorPage(message: String) {{
@@ -475,8 +548,8 @@ class MainActivity : AppCompatActivity() {{
 		val html = "<html><body style=\\"font-family: sans-serif; padding: 20px; background: #ffffff; color: #222222;\\">" +
 			"<h2>Unable to load app</h2>" +
 			"<p>" + safeMessage + "</p>" +
-			"<p>Current URL: <code>" + startUrl + "</code></p>" +
-			"<p>Edit <code>MainActivity.kt</code> and set <code>startUrl</code> to your Frappe site URL.</p>" +
+			"<p>Current page: <code>" + startPage + "</code></p>" +
+			"<p>Edit <code>app/src/main/assets/frappe_native/index.html</code> to customize this app screen.</p>" +
 			"</body></html>"
 		webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
 	}}
@@ -602,7 +675,9 @@ This project scaffold was generated for app: `{app_name}`.
 
 Install Android Studio / Android SDK and ensure `gradle` is available.
 
-Set your startup URL in `mobile/android/app/src/main/java/.../MainActivity.kt` (`startUrl`).
+Edit your standalone start page:
+
+`mobile/android/app/src/main/assets/frappe_native/index.html`
 
 ## 2) Build debug APK
 
