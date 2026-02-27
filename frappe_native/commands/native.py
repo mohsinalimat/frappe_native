@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import click
@@ -114,6 +116,7 @@ def init_native_project(
 			click.echo(f"  - {note}")
 
 	click.echo("\nNext steps:")
+	click.echo(f"  bench native doctor --app {app_name} --target android")
 	click.echo(f"  cd {android_root}")
 	if (android_root / "gradlew").exists():
 		click.echo("  ./gradlew assembleDebug")
@@ -121,6 +124,484 @@ def init_native_project(
 		click.echo("  gradle wrapper --gradle-version 8.7")
 		click.echo("  ./gradlew assembleDebug")
 	click.echo(f"  cat apps/{app_name}/docs/mobile-quickstart.md")
+
+
+@native.command("doctor", help="Validate Android native project readiness for an app.")
+@click.option("--app", "app_name", required=True, help="Frappe app name under apps/.")
+@click.option(
+	"--target",
+	type=click.Choice(["android"], case_sensitive=False),
+	default="android",
+	show_default=True,
+	help="Native target to validate.",
+)
+@click.option("--strict", is_flag=True, help="Treat warnings as failures.")
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON output.")
+@click.option("--build-check", is_flag=True, help="Run `./gradlew assembleDebug` smoke test.")
+def doctor_native_project(
+	app_name: str,
+	target: str,
+	strict: bool = False,
+	json_output: bool = False,
+	build_check: bool = False,
+):
+	if target != "android":
+		raise click.ClickException("Only Android doctor checks are supported right now.")
+
+	bench_path = Path(frappe.utils.get_bench_path())
+	app_path = bench_path / "apps" / app_name
+	android_root = app_path / "mobile" / "android"
+	checks: list[dict] = []
+
+	_add_check(
+		checks,
+		key="app.path",
+		status="pass" if app_path.exists() else "fail",
+		message=f"App path {'found' if app_path.exists() else 'missing'}: {app_path}",
+		fix=None if app_path.exists() else f"Create app first: bench new-app {app_name}",
+	)
+
+	hooks_path = app_path / app_name / "hooks.py"
+	_add_check(
+		checks,
+		key="app.hooks",
+		status="pass" if hooks_path.exists() else "fail",
+		message=f"hooks.py {'found' if hooks_path.exists() else 'missing'}: {hooks_path}",
+		fix=None if hooks_path.exists() else f"Expected Frappe app package at {app_name}/{app_name}/hooks.py",
+	)
+
+	_add_check(
+		checks,
+		key="android.scaffold",
+		status="pass" if android_root.exists() else "fail",
+		message=f"Android scaffold {'found' if android_root.exists() else 'missing'}: {android_root}",
+		fix=None
+		if android_root.exists()
+		else f"Run: bench native init --app {app_name} --platform android",
+	)
+
+	settings_gradle = android_root / "settings.gradle.kts"
+	settings_ok = settings_gradle.exists()
+	_add_check(
+		checks,
+		key="android.settings",
+		status="pass" if settings_ok else "fail",
+		message=f"settings.gradle.kts {'found' if settings_ok else 'missing'}",
+		fix=None if settings_ok else f"Run: bench native init --app {app_name} --platform android --force",
+	)
+
+	if settings_ok:
+		settings_text = _read_text(settings_gradle)
+		has_plugin_repos = all(
+			token in settings_text for token in ("pluginManagement", "google()", "mavenCentral()")
+		)
+		_add_check(
+			checks,
+			key="android.repositories",
+			status="pass" if has_plugin_repos else "fail",
+			message="Plugin repositories configured in settings.gradle.kts",
+			fix=None
+			if has_plugin_repos
+			else f"Regenerate scaffold: bench native init --app {app_name} --platform android --force",
+		)
+
+	main_activity = _resolve_main_activity(android_root)
+	_add_check(
+		checks,
+		key="android.main_activity",
+		status="pass" if main_activity else "fail",
+		message=f"MainActivity {'found' if main_activity else 'missing'}",
+		fix=None
+		if main_activity
+		else f"Regenerate scaffold: bench native init --app {app_name} --platform android --force",
+	)
+
+	if main_activity:
+		main_activity_text = _read_text(main_activity)
+		loads_asset = 'file:///android_asset/frappe_native/index.html' in main_activity_text
+		_add_check(
+			checks,
+			key="android.start_page_mode",
+			status="pass" if loads_asset else "warn",
+			message=(
+				"MainActivity loads bundled local asset page"
+				if loads_asset
+				else "MainActivity does not load bundled local asset page by default"
+			),
+			fix=(
+				"Set start page to file:///android_asset/frappe_native/index.html or re-run init --force"
+				if not loads_asset
+				else None
+			),
+		)
+
+	asset_index = android_root / "app" / "src" / "main" / "assets" / "frappe_native" / "index.html"
+	_add_check(
+		checks,
+		key="android.start_page_file",
+		status="pass" if asset_index.exists() else "fail",
+		message=f"Standalone page {'found' if asset_index.exists() else 'missing'}: {asset_index}",
+		fix=None if asset_index.exists() else "Re-run init --force to generate default standalone page",
+	)
+
+	gradlew_path = android_root / "gradlew"
+	_add_check(
+		checks,
+		key="android.gradle_wrapper",
+		status="pass" if gradlew_path.exists() else "warn",
+		message=f"Gradle wrapper {'found' if gradlew_path.exists() else 'missing'}: {gradlew_path}",
+		fix=None
+		if gradlew_path.exists()
+		else f"cd {android_root} && gradle wrapper --gradle-version 8.7",
+	)
+
+	java_version = _get_java_major_version()
+	if java_version is None:
+		_add_check(
+			checks,
+			key="tool.java",
+			status="fail",
+			message="Java is not available in PATH",
+			fix="Install JDK 17 and export JAVA_HOME",
+		)
+	elif java_version == 17:
+		_add_check(
+			checks,
+			key="tool.java",
+			status="pass",
+			message="Java 17 detected",
+		)
+	else:
+		_add_check(
+			checks,
+			key="tool.java",
+			status="warn",
+			message=f"Java {java_version} detected (recommended: 17 for consistent Android builds)",
+			fix="Export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64",
+		)
+
+	gradle_version = _get_gradle_version()
+	if gradle_version:
+		_add_check(checks, key="tool.gradle", status="pass", message=f"Gradle {gradle_version} detected")
+	else:
+		_add_check(
+			checks,
+			key="tool.gradle",
+			status="warn",
+			message="Gradle not found in PATH",
+			fix="Install Gradle 8.x (or rely on existing ./gradlew)",
+		)
+
+	local_properties = android_root / "local.properties"
+	sdk_dir = _get_android_sdk_dir(local_properties)
+	if sdk_dir is None:
+		_add_check(
+			checks,
+			key="android.sdk_dir",
+			status="fail",
+			message="Android SDK path is not configured",
+			fix=(
+				f"Set sdk.dir in {local_properties} or export ANDROID_SDK_ROOT=/path/to/Android/Sdk"
+			),
+		)
+	else:
+		sdk_path = Path(sdk_dir).expanduser()
+		_add_check(
+			checks,
+			key="android.sdk_dir",
+			status="pass" if sdk_path.exists() else "fail",
+			message=f"Android SDK path: {sdk_path}",
+			fix=None
+			if sdk_path.exists()
+			else f"Install Android SDK and update {local_properties} (sdk.dir=...)",
+		)
+		if sdk_path.exists():
+			_check_required_android_sdk(checks, sdk_path)
+			_check_adb(checks, sdk_path)
+		else:
+			_add_check(
+				checks,
+				key="android.adb",
+				status="warn",
+				message="Skipping adb checks because SDK path does not exist",
+			)
+
+	apk_path = android_root / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
+	_add_check(
+		checks,
+		key="android.debug_apk",
+		status="pass" if apk_path.exists() else "warn",
+		message=f"Debug APK {'found' if apk_path.exists() else 'not found'}: {apk_path}",
+		fix=None if apk_path.exists() else f"cd {android_root} && ./gradlew assembleDebug",
+	)
+
+	if build_check:
+		if gradlew_path.exists():
+			ok, output = _run_gradle_assemble(android_root)
+			_add_check(
+				checks,
+				key="android.build_smoke",
+				status="pass" if ok else "fail",
+				message="Gradle assembleDebug succeeded" if ok else "Gradle assembleDebug failed",
+				fix=None if ok else output,
+			)
+		else:
+			_add_check(
+				checks,
+				key="android.build_smoke",
+				status="fail",
+				message="Cannot run build smoke test without ./gradlew",
+				fix=f"cd {android_root} && gradle wrapper --gradle-version 8.7",
+			)
+
+	summary = _build_summary(checks)
+	should_fail = summary["fail"] > 0 or (strict and summary["warn"] > 0)
+
+	if json_output:
+		click.echo(
+			json.dumps(
+				{
+					"app": app_name,
+					"target": target,
+					"checks": checks,
+					"summary": summary,
+					"strict": strict,
+					"ok": not should_fail,
+				},
+				indent=2,
+			)
+		)
+	else:
+		click.echo(f"Native doctor report for app '{app_name}' ({target})")
+		for check in checks:
+			_status_line(check)
+		click.echo(
+			f"\nSummary: {summary['pass']} pass, {summary['warn']} warn, {summary['fail']} fail"
+		)
+		if should_fail:
+			click.secho("Doctor status: NOT READY", fg="red")
+		else:
+			click.secho("Doctor status: READY", fg="green")
+
+	if should_fail:
+		sys.exit(1)
+
+
+def _add_check(
+	checks: list[dict],
+	key: str,
+	status: str,
+	message: str,
+	fix: str | None = None,
+) -> None:
+	check = {"key": key, "status": status, "message": message}
+	if fix:
+		check["fix"] = fix
+	checks.append(check)
+
+
+def _read_text(path: Path) -> str:
+	try:
+		return path.read_text(encoding="utf-8")
+	except Exception:
+		return ""
+
+
+def _resolve_main_activity(android_root: Path) -> Path | None:
+	base = android_root / "app" / "src" / "main" / "java"
+	if not base.exists():
+		return None
+	main_files = sorted(base.glob("**/MainActivity.kt"))
+	return main_files[0] if main_files else None
+
+
+def _extract_major_version(raw: str) -> int | None:
+	match = re.search(r'version "(\d+)', raw)
+	if match:
+		return int(match.group(1))
+	return None
+
+
+def _get_java_major_version() -> int | None:
+	java_bin = shutil.which("java")
+	if not java_bin:
+		return None
+	try:
+		proc = subprocess.run(
+			[java_bin, "-version"],
+			check=False,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=10,
+		)
+	except (subprocess.SubprocessError, OSError):
+		return None
+
+	raw = (proc.stderr or "") + "\n" + (proc.stdout or "")
+	return _extract_major_version(raw)
+
+
+def _get_gradle_version() -> str | None:
+	gradle_bin = shutil.which("gradle")
+	if not gradle_bin:
+		return None
+	try:
+		proc = subprocess.run(
+			[gradle_bin, "-v"],
+			check=False,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=10,
+		)
+	except (subprocess.SubprocessError, OSError):
+		return None
+
+	for line in (proc.stdout or "").splitlines():
+		if line.strip().startswith("Gradle "):
+			return line.strip().replace("Gradle ", "")
+	return None
+
+
+def _parse_local_properties(path: Path) -> dict[str, str]:
+	if not path.exists():
+		return {}
+	props = {}
+	for raw_line in _read_text(path).splitlines():
+		line = raw_line.strip()
+		if not line or line.startswith("#") or "=" not in line:
+			continue
+		key, value = line.split("=", 1)
+		props[key.strip()] = value.strip().replace("\\\\", "\\")
+	return props
+
+
+def _get_android_sdk_dir(local_properties: Path) -> str | None:
+	props = _parse_local_properties(local_properties)
+	if props.get("sdk.dir"):
+		return props["sdk.dir"]
+	return os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
+
+
+def _check_required_android_sdk(checks: list[dict], sdk_path: Path) -> None:
+	platform_tools = sdk_path / "platform-tools"
+	platform_34 = sdk_path / "platforms" / "android-34"
+	build_tools_dir = sdk_path / "build-tools"
+	has_build_tools_34 = any(
+		item.is_dir() and item.name.startswith("34.") for item in build_tools_dir.glob("*")
+	) if build_tools_dir.exists() else False
+
+	_add_check(
+		checks,
+		key="android.sdk.platform_tools",
+		status="pass" if platform_tools.exists() else "fail",
+		message=f"SDK platform-tools {'found' if platform_tools.exists() else 'missing'}",
+		fix=None if platform_tools.exists() else "Install Android SDK Platform-Tools in Android Studio SDK Manager",
+	)
+	_add_check(
+		checks,
+		key="android.sdk.platform_34",
+		status="pass" if platform_34.exists() else "fail",
+		message=f"SDK platform android-34 {'found' if platform_34.exists() else 'missing'}",
+		fix=None if platform_34.exists() else "Install Android SDK Platform 34 in Android Studio SDK Manager",
+	)
+	_add_check(
+		checks,
+		key="android.sdk.build_tools_34",
+		status="pass" if has_build_tools_34 else "fail",
+		message="SDK build-tools 34.x " + ("found" if has_build_tools_34 else "missing"),
+		fix=None if has_build_tools_34 else "Install Android SDK Build-Tools 34.x in Android Studio SDK Manager",
+	)
+
+
+def _check_adb(checks: list[dict], sdk_path: Path) -> None:
+	adb_from_path = shutil.which("adb")
+	adb_from_sdk = sdk_path / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb")
+	adb_path = Path(adb_from_path) if adb_from_path else (adb_from_sdk if adb_from_sdk.exists() else None)
+
+	_add_check(
+		checks,
+		key="android.adb.binary",
+		status="pass" if adb_path else "fail",
+		message=f"adb {'found' if adb_path else 'not found'}"
+		+ (f": {adb_path}" if adb_path else ""),
+		fix=None if adb_path else "Ensure Android SDK Platform-Tools are installed and adb is in PATH",
+	)
+
+	if not adb_path:
+		return
+
+	try:
+		proc = subprocess.run(
+			[str(adb_path), "devices"],
+			check=False,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=10,
+		)
+	except (subprocess.SubprocessError, OSError):
+		_add_check(
+			checks,
+			key="android.adb.devices",
+			status="warn",
+			message="Could not query adb devices",
+			fix="Run `adb start-server` and reconnect your device",
+		)
+		return
+
+	device_lines = [
+		line for line in (proc.stdout or "").splitlines()[1:] if line.strip().endswith("\tdevice")
+	]
+	_add_check(
+		checks,
+		key="android.adb.devices",
+		status="pass" if device_lines else "warn",
+		message=f"Connected devices: {len(device_lines)}",
+		fix=None
+		if device_lines
+		else "Connect device with USB debugging enabled, then run `adb devices`",
+	)
+
+
+def _run_gradle_assemble(android_root: Path) -> tuple[bool, str]:
+	try:
+		proc = subprocess.run(
+			["./gradlew", "assembleDebug"],
+			cwd=android_root,
+			check=False,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=600,
+		)
+	except subprocess.TimeoutExpired:
+		return False, "Build timed out after 10 minutes"
+	except (subprocess.SubprocessError, OSError) as error:
+		return False, str(error)
+
+	if proc.returncode == 0:
+		return True, "Build succeeded"
+
+	error_line = _last_non_empty_line(proc.stderr) or _last_non_empty_line(proc.stdout)
+	return False, error_line or "Build failed"
+
+
+def _build_summary(checks: list[dict]) -> dict[str, int]:
+	return {
+		"pass": sum(1 for check in checks if check["status"] == "pass"),
+		"warn": sum(1 for check in checks if check["status"] == "warn"),
+		"fail": sum(1 for check in checks if check["status"] == "fail"),
+	}
+
+
+def _status_line(check: dict) -> None:
+	label = check["status"].upper().ljust(4)
+	color = {"pass": "green", "warn": "yellow", "fail": "red"}[check["status"]]
+	click.secho(f"{label} {check['key']}: {check['message']}", fg=color)
+	if check.get("fix"):
+		click.echo(f"     fix: {check['fix']}")
 
 
 def _post_init_android_setup(android_root: Path, force: bool) -> list[str]:
@@ -679,7 +1160,13 @@ Edit your standalone start page:
 
 `mobile/android/app/src/main/assets/frappe_native/index.html`
 
-## 2) Build debug APK
+## 2) Run doctor checks
+
+```bash
+bench native doctor --app {app_name} --target android
+```
+
+## 3) Build debug APK
 
 ```bash
 cd apps/{app_name}/mobile/android
