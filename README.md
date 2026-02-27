@@ -1,9 +1,9 @@
 # Frappe Native
 
-Turn your Frappe app into a real mobile app.
+Turn your Frappe app into a native cross-platform product.
 
-Build fast, ship confidently, and run your app on Android with a native wrapper powered by Bench.
-Use plain HTML/CSS/JS, Vue, or React for your app UI - Frappe Native handles the mobile packaging workflow.
+Build once with HTML/CSS/JS, Vue, or React, and ship across Android, iOS, and desktop from a single app architecture.
+Frappe Native handles project scaffolding, environment validation, build, install, and run workflows through Bench.
 
 ## Ready Now
 
@@ -12,8 +12,7 @@ Use plain HTML/CSS/JS, Vue, or React for your app UI - Frappe Native handles the
 - Build installable APKs for debug or release (`bench native build`)
 - Build, install, and launch directly on device (`bench native run`)
 
-Android is fully supported today.
-iOS and desktop support are coming next.
+Android is available now, with iOS and desktop following the same platform model.
 
 ## Install
 
