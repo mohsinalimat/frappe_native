@@ -118,6 +118,7 @@ def init_native_project(
 	click.echo("\nNext steps:")
 	click.echo(f"  bench native doctor --app {app_name} --target android")
 	click.echo(f"  bench native build --app {app_name} --target android --variant debug")
+	click.echo(f"  bench native run --app {app_name} --target android --variant debug")
 	click.echo(f"  cat apps/{app_name}/docs/mobile-quickstart.md")
 
 
@@ -398,75 +399,39 @@ def doctor_native_project(
 	show_default=True,
 	help="Android build variant.",
 )
+@click.option("--install", is_flag=True, help="Install APK via adb after a successful debug build.")
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON output.")
 def build_native_project(
 	app_name: str,
 	target: str,
 	variant: str,
+	install: bool = False,
 	json_output: bool = False,
 ):
 	if target != "android":
 		raise click.ClickException("Only Android builds are supported right now.")
 
-	bench_path = Path(frappe.utils.get_bench_path())
-	app_path = bench_path / "apps" / app_name
-	android_root = app_path / "mobile" / "android"
+	_, _, android_root = _resolve_android_paths(app_name)
+	gradle_task, apk_paths = _build_android_variant(
+		android_root=android_root, app_name=app_name, variant=variant, verbose=not json_output
+	)
 
-	if not app_path.exists():
-		raise click.ClickException(f"App '{app_name}' was not found at {app_path}.")
-	if not android_root.exists():
-		raise click.ClickException(
-			f"Android scaffold not found at {android_root}. Run `bench native init --app {app_name} --platform android` first."
-		)
+	installed_apk_path = None
+	if install:
+		if variant != "debug":
+			raise click.ClickException("--install is currently supported only with --variant debug.")
+		if not apk_paths:
+			raise click.ClickException("Build succeeded but no APK was found to install.")
 
-	gradlew_cmd = _get_gradle_wrapper_cmd(android_root)
-	if gradlew_cmd is None:
-		gradle_bin = shutil.which("gradle")
-		if not gradle_bin:
-			raise click.ClickException(
-				"Gradle wrapper is missing and `gradle` is not in PATH. "
-				f"Run `cd {android_root} && gradle wrapper --gradle-version 8.7` first."
-			)
-		try:
-			subprocess.run(
-				[gradle_bin, "wrapper", "--gradle-version", "8.7"],
-				cwd=android_root,
-				check=True,
-				stdout=subprocess.PIPE,
-				stderr=subprocess.PIPE,
-				text=True,
-			)
-		except subprocess.CalledProcessError as error:
-			last_line = _last_non_empty_line(error.stderr) or _last_non_empty_line(error.stdout)
-			raise click.ClickException(
-				f"Failed to generate Gradle wrapper automatically: {last_line or 'unknown error'}"
-			) from error
+		adb_path = _resolve_adb_path(android_root)
+		if adb_path is None:
+			raise click.ClickException("adb not found. Install Android SDK Platform-Tools and ensure adb is in PATH.")
 
-		gradlew_cmd = _get_gradle_wrapper_cmd(android_root)
-		if gradlew_cmd is None:
-			raise click.ClickException("Gradle wrapper generation completed but wrapper executable was not found.")
+		install_ok, install_message = _install_apk(adb_path=adb_path, apk_path=apk_paths[0])
+		if not install_ok:
+			raise click.ClickException(install_message)
+		installed_apk_path = apk_paths[0]
 
-	gradle_task = f"assemble{variant.capitalize()}"
-	click.echo(f"Running {gradle_task} for '{app_name}' ...")
-
-	build_ok, build_message = _run_gradle_task(android_root, gradlew_cmd, gradle_task)
-	if not build_ok:
-		if json_output:
-			click.echo(
-				json.dumps(
-					{
-						"app": app_name,
-						"target": target,
-						"variant": variant,
-						"ok": False,
-						"error": build_message,
-					},
-					indent=2,
-				)
-			)
-		raise click.ClickException(build_message)
-
-	apk_paths = _find_apk_outputs(android_root, variant)
 	if json_output:
 		click.echo(
 			json.dumps(
@@ -477,6 +442,8 @@ def build_native_project(
 					"ok": True,
 					"task": gradle_task,
 					"apk_paths": [str(path) for path in apk_paths],
+					"installed": bool(installed_apk_path),
+					"installed_apk_path": str(installed_apk_path) if installed_apk_path else None,
 				},
 				indent=2,
 			)
@@ -492,6 +459,84 @@ def build_native_project(
 		click.echo(
 			f"Build succeeded but no APK found under {android_root / 'app' / 'build' / 'outputs' / 'apk' / variant}"
 		)
+	if installed_apk_path:
+		click.secho(f"Installed on device: {installed_apk_path}", fg="green")
+
+
+@native.command("run", help="Build, install, and launch Android app on connected device.")
+@click.option("--app", "app_name", required=True, help="Frappe app name under apps/.")
+@click.option(
+	"--target",
+	type=click.Choice(["android"], case_sensitive=False),
+	default="android",
+	show_default=True,
+	help="Native target to run.",
+)
+@click.option(
+	"--variant",
+	type=click.Choice(["debug", "release"], case_sensitive=False),
+	default="debug",
+	show_default=True,
+	help="Android build variant.",
+)
+@click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON output.")
+def run_native_project(
+	app_name: str,
+	target: str,
+	variant: str,
+	json_output: bool = False,
+):
+	if target != "android":
+		raise click.ClickException("Only Android run is supported right now.")
+	if variant != "debug":
+		raise click.ClickException("`bench native run` currently supports only --variant debug.")
+
+	_, _, android_root = _resolve_android_paths(app_name)
+	gradle_task, apk_paths = _build_android_variant(
+		android_root=android_root, app_name=app_name, variant=variant, verbose=not json_output
+	)
+
+	if not apk_paths:
+		raise click.ClickException("Build succeeded but no APK was found to install/run.")
+
+	adb_path = _resolve_adb_path(android_root)
+	if adb_path is None:
+		raise click.ClickException("adb not found. Install Android SDK Platform-Tools and ensure adb is in PATH.")
+
+	install_ok, install_message = _install_apk(adb_path=adb_path, apk_path=apk_paths[0])
+	if not install_ok:
+		raise click.ClickException(install_message)
+
+	package_name = _resolve_package_name(android_root)
+	if not package_name:
+		raise click.ClickException("Could not determine applicationId for launching app.")
+
+	launch_ok, launch_message = _launch_app(adb_path=adb_path, package_name=package_name)
+	if not launch_ok:
+		raise click.ClickException(launch_message)
+
+	if json_output:
+		click.echo(
+			json.dumps(
+				{
+					"app": app_name,
+					"target": target,
+					"variant": variant,
+					"ok": True,
+					"task": gradle_task,
+					"apk_path": str(apk_paths[0]),
+					"package": package_name,
+					"install": install_message,
+					"launch": launch_message,
+				},
+				indent=2,
+			)
+		)
+		return
+
+	click.secho("Run completed successfully.", fg="green")
+	click.echo(f"APK installed: {apk_paths[0]}")
+	click.echo(f"Launched package: {package_name}")
 
 
 def _add_check(
@@ -591,6 +636,21 @@ def _get_android_sdk_dir(local_properties: Path) -> str | None:
 	return os.environ.get("ANDROID_SDK_ROOT") or os.environ.get("ANDROID_HOME")
 
 
+def _resolve_adb_path(android_root: Path) -> Path | None:
+	adb_from_path = shutil.which("adb")
+	if adb_from_path:
+		return Path(adb_from_path)
+
+	local_properties = android_root / "local.properties"
+	sdk_dir = _get_android_sdk_dir(local_properties)
+	if not sdk_dir:
+		return None
+
+	sdk_path = Path(sdk_dir).expanduser()
+	candidate = sdk_path / "platform-tools" / ("adb.exe" if os.name == "nt" else "adb")
+	return candidate if candidate.exists() else None
+
+
 def _check_required_android_sdk(checks: list[dict], sdk_path: Path) -> None:
 	platform_tools = sdk_path / "platform-tools"
 	platform_34 = sdk_path / "platforms" / "android-34"
@@ -670,6 +730,135 @@ def _check_adb(checks: list[dict], sdk_path: Path) -> None:
 		if device_lines
 		else "Connect device with USB debugging enabled, then run `adb devices`",
 	)
+
+
+def _resolve_android_paths(app_name: str) -> tuple[Path, Path, Path]:
+	bench_path = Path(frappe.utils.get_bench_path())
+	app_path = bench_path / "apps" / app_name
+	android_root = app_path / "mobile" / "android"
+
+	if not app_path.exists():
+		raise click.ClickException(f"App '{app_name}' was not found at {app_path}.")
+	if not android_root.exists():
+		raise click.ClickException(
+			f"Android scaffold not found at {android_root}. Run `bench native init --app {app_name} --platform android` first."
+		)
+	return bench_path, app_path, android_root
+
+
+def _ensure_gradle_wrapper(android_root: Path) -> list[str]:
+	gradlew_cmd = _get_gradle_wrapper_cmd(android_root)
+	if gradlew_cmd:
+		return gradlew_cmd
+
+	gradle_bin = shutil.which("gradle")
+	if not gradle_bin:
+		raise click.ClickException(
+			"Gradle wrapper is missing and `gradle` is not in PATH. "
+			f"Run `cd {android_root} && gradle wrapper --gradle-version 8.7` first."
+		)
+	try:
+		subprocess.run(
+			[gradle_bin, "wrapper", "--gradle-version", "8.7"],
+			cwd=android_root,
+			check=True,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+		)
+	except subprocess.CalledProcessError as error:
+		last_line = _last_non_empty_line(error.stderr) or _last_non_empty_line(error.stdout)
+		raise click.ClickException(
+			f"Failed to generate Gradle wrapper automatically: {last_line or 'unknown error'}"
+		) from error
+
+	gradlew_cmd = _get_gradle_wrapper_cmd(android_root)
+	if gradlew_cmd is None:
+		raise click.ClickException("Gradle wrapper generation completed but wrapper executable was not found.")
+	return gradlew_cmd
+
+
+def _build_android_variant(
+	android_root: Path, app_name: str, variant: str, verbose: bool = True
+) -> tuple[str, list[Path]]:
+	gradlew_cmd = _ensure_gradle_wrapper(android_root)
+	gradle_task = f"assemble{variant.capitalize()}"
+	if verbose:
+		click.echo(f"Running {gradle_task} for '{app_name}' ...")
+
+	build_ok, build_message = _run_gradle_task(android_root, gradlew_cmd, gradle_task)
+	if not build_ok:
+		raise click.ClickException(build_message)
+
+	return gradle_task, _find_apk_outputs(android_root, variant)
+
+
+def _install_apk(adb_path: Path, apk_path: Path) -> tuple[bool, str]:
+	try:
+		proc = subprocess.run(
+			[str(adb_path), "install", "-r", str(apk_path)],
+			check=False,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=120,
+		)
+	except subprocess.TimeoutExpired:
+		return False, "adb install timed out"
+	except (subprocess.SubprocessError, OSError) as error:
+		return False, f"adb install failed: {error}"
+
+	output = "\n".join(filter(None, [proc.stdout.strip(), proc.stderr.strip()])).strip()
+	if proc.returncode != 0:
+		return False, output or "adb install failed"
+	if "Success" not in output:
+		return False, output or "adb install did not report Success"
+	return True, "adb install succeeded"
+
+
+def _resolve_package_name(android_root: Path) -> str | None:
+	build_gradle = android_root / "app" / "build.gradle.kts"
+	text = _read_text(build_gradle)
+	match = re.search(r'applicationId\s*=\s*"([^"]+)"', text)
+	if match:
+		return match.group(1)
+	main_activity = _resolve_main_activity(android_root)
+	if main_activity:
+		main_text = _read_text(main_activity)
+		package_match = re.search(r"^package\s+([a-zA-Z0-9_\\.]+)", main_text, flags=re.MULTILINE)
+		if package_match:
+			return package_match.group(1)
+	return None
+
+
+def _launch_app(adb_path: Path, package_name: str) -> tuple[bool, str]:
+	try:
+		proc = subprocess.run(
+			[
+				str(adb_path),
+				"shell",
+				"monkey",
+				"-p",
+				package_name,
+				"-c",
+				"android.intent.category.LAUNCHER",
+				"1",
+			],
+			check=False,
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			text=True,
+			timeout=30,
+		)
+	except subprocess.TimeoutExpired:
+		return False, "App launch timed out"
+	except (subprocess.SubprocessError, OSError) as error:
+		return False, f"Failed to launch app: {error}"
+
+	output = "\n".join(filter(None, [proc.stdout.strip(), proc.stderr.strip()])).strip()
+	if proc.returncode != 0:
+		return False, output or f"Failed to launch package {package_name}"
+	return True, f"Launched package {package_name}"
 
 
 def _get_gradle_wrapper_cmd(android_root: Path) -> list[str] | None:
@@ -1300,6 +1489,12 @@ bench native doctor --app {app_name} --target android
 
 ```bash
 bench native build --app {app_name} --target android --variant debug
+```
+
+## 4) Build + Install + Launch in one command
+
+```bash
+bench native run --app {app_name} --target android --variant debug
 ```
 
 If you still prefer manual Gradle:
