@@ -1,0 +1,32 @@
+openapi: 3.0.3
+info:
+  title: Native Mobile API
+  version: 1.0.0
+servers:
+  - url: https://example.com
+paths:
+  /api/method/frappe_native.api.v1.health.ping:
+    get:
+      summary: Health ping
+      responses:
+        "200":
+          description: Successful ping
+  /api/method/frappe_native.api.v1.auth.login:
+    post:
+      summary: Login for native clients
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                email:
+                  type: string
+                password:
+                  type: string
+                device_id:
+                  type: string
+      responses:
+        "200":
+          description: Auth successful

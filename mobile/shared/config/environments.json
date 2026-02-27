@@ -1,0 +1,17 @@
+{
+	"dev": {
+		"api_base_url": "http://10.0.2.2:8000",
+		"socket_url": "ws://10.0.2.2:9000",
+		"site_name": "dev.localhost"
+	},
+	"staging": {
+		"api_base_url": "https://staging.example.com",
+		"socket_url": "wss://staging.example.com/socket.io",
+		"site_name": "staging.example.com"
+	},
+	"prod": {
+		"api_base_url": "https://example.com",
+		"socket_url": "wss://example.com/socket.io",
+		"site_name": "example.com"
+	}
+}

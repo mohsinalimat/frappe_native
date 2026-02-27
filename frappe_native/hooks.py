@@ -5,6 +5,10 @@ app_description = "Cross-platform Frappe companion app for Android, iOS, and des
 app_email = "sydneykb38@gmail.com"
 app_license = "mit"
 
+# App-specific bench commands
+# ---------------------------
+commands = ["frappe_native.commands"]
+
 # Apps
 # ------------------
 
@@ -246,4 +250,3 @@ app_license = "mit"
 # ------------
 # List of apps whose translatable strings should be excluded from this app's translations.
 # ignore_translatable_strings_from = []
-
