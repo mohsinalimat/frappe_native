@@ -1,12 +1,19 @@
 # Frappe Native
 
-Android-first native tooling for Frappe apps.
+Turn your Frappe app into a real mobile app.
 
-Current MVP supports:
-- App scaffold generation (`bench native init`)
-- Environment and tooling validation (`bench native doctor`)
-- APK build (`bench native build`)
-- Build + install + launch (`bench native run`)
+Build fast, ship confidently, and run your app on Android with a native wrapper powered by Bench.
+Use plain HTML/CSS/JS, Vue, or React for your app UI - Frappe Native handles the mobile packaging workflow.
+
+## Ready Now
+
+- Create a native Android project instantly (`bench native init`)
+- Verify your full environment in one command (`bench native doctor`)
+- Build installable APKs for debug or release (`bench native build`)
+- Build, install, and launch directly on device (`bench native run`)
+
+Android is fully supported today.
+iOS and desktop support are coming next.
 
 ## Install
 
