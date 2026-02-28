@@ -54,6 +54,46 @@ Optional files:
 
 `bench native build` and `bench native run` automatically sync `mobile/app/*` into Android assets before compiling.
 
+### Generated Folder Structure
+
+```text
+apps/<your_app>/
+├── contracts/
+│   └── openapi/
+│       └── mobile-v1.yaml
+├── docs/
+│   └── mobile-quickstart.md
+└── mobile/
+    ├── app/                              # edit here (your UI source)
+    │   ├── index.html
+    │   ├── styles.css
+    │   └── app.js
+    ├── shared/
+    │   ├── config/
+    │   │   └── environments.json
+    │   └── sdk/
+    │       └── README.md
+    └── android/
+        ├── settings.gradle.kts
+        ├── build.gradle.kts
+        ├── gradle.properties
+        ├── local.properties.example
+        ├── app/
+        │   ├── build.gradle.kts
+        │   └── src/main/
+        │       ├── AndroidManifest.xml
+        │       ├── java/com/frappe/<your_app>/
+        │       │   ├── MainActivity.kt
+        │       │   └── NativeBridge.kt
+        │       ├── res/layout/activity_main.xml
+        │       ├── res/values/strings.xml
+        │       └── assets/frappe_native/ # synced copy for APK runtime
+        │           ├── index.html
+        │           ├── styles.css
+        │           └── app.js
+        └── README.md
+```
+
 ## Command Reference
 
 ### `bench native init`
