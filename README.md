@@ -1,9 +1,9 @@
-# Frappe Native
+<h1 align="center">Frappe Native</h1>
 
-Turn your Frappe app into a native cross-platform product.
+<p align="center">Cross-platform native framework for Frappe apps.</p>
 
-Build once with HTML/CSS/JS, Vue, or React, and ship across Android, iOS, and desktop from a single app architecture.
-Frappe Native handles project scaffolding, environment validation, build, install, and run workflows through Bench.
+Build once with HTML/CSS/JS, Vue, or React, then ship to Android, iOS, and desktop from one app architecture.
+Frappe Native provides Bench-powered scaffolding, environment checks, build, install, and run workflows.
 
 ## Ready Now
 
