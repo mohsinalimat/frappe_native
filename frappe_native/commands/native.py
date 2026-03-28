@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 import click
 import frappe
@@ -15,6 +16,147 @@ import frappe
 @click.group("native", help="Native app tooling for mobile and desktop clients.")
 def native():
 	"""Group for native tooling commands."""
+
+
+@native.group("auth", help="Native authentication scaffolding and setup.")
+def native_auth():
+	"""Group for native auth commands."""
+
+
+@native_auth.command("init", help="Configure OAuth auth flow and scaffold login UI for native app.")
+@click.option("--app", "app_name", required=True, help="Frappe app name under apps/.")
+@click.option("--site", required=True, help="Site where OAuth Client will be created/updated.")
+@click.option(
+	"--target",
+	type=click.Choice(["android"], case_sensitive=False),
+	default="android",
+	show_default=True,
+	help="Native target for auth setup.",
+)
+@click.option(
+	"--base-url",
+	default=None,
+	help="Public site URL used by the mobile app (e.g. https://erp.example.com).",
+)
+@click.option("--force", is_flag=True, help="Overwrite custom files that are not recognized as generated.")
+def init_native_auth(
+	app_name: str,
+	site: str,
+	target: str,
+	base_url: str | None = None,
+	force: bool = False,
+):
+	if target != "android":
+		raise click.ClickException("Only Android auth scaffolding is supported right now.")
+
+	bench_path, app_path, android_root = _resolve_android_paths(app_name)
+	site_path = bench_path / "sites" / site
+	if not site_path.exists():
+		raise click.ClickException(f"Site '{site}' was not found at {site_path}.")
+
+	package_id = _resolve_package_name(android_root) or f"com.frappe.{_sanitize_identifier(app_name)}"
+	package_path = package_id.replace(".", "/")
+	redirect_scheme = _default_redirect_scheme(app_name)
+	redirect_host = "oauth-callback"
+	redirect_uri = f"{redirect_scheme}://{redirect_host}"
+
+	public_base_url = _resolve_site_base_url(site=site, site_path=site_path, explicit_base_url=base_url)
+	oauth_client = _configure_oauth_client_for_site(
+		site=site,
+		app_name=app_name,
+		redirect_uri=redirect_uri,
+		scope="all openid",
+	)
+	client_id = oauth_client["client_id"]
+
+	display_name = _titleize(app_name)
+	auth_files = {
+		Path("mobile/app/index.html"): _auth_index_template(display_name=display_name),
+		Path("mobile/app/styles.css"): _auth_styles_template(),
+		Path("mobile/app/app.js"): _auth_app_js_template(),
+		Path("mobile/app/auth.config.json"): _auth_config_template(
+			site_url=public_base_url,
+			bootstrap_method=f"{app_name}.api.mobile_auth.get_client_id",
+			redirect_uri=redirect_uri,
+			scope="all openid",
+		),
+		Path(f"{app_name}/api/__init__.py"): "",
+		Path(f"{app_name}/api/mobile_auth.py"): _mobile_auth_api_template(
+			app_name=app_name,
+			display_name=display_name,
+			client_id=client_id,
+			redirect_uri=redirect_uri,
+			scope="all openid",
+		),
+		Path("docs/mobile-auth.md"): _auth_quickstart_template(
+			app_name=app_name, site=site, redirect_uri=redirect_uri
+		),
+		Path("mobile/android/app/src/main/AndroidManifest.xml"): _manifest_template(
+			package_id=package_id,
+			redirect_scheme=redirect_scheme,
+			redirect_host=redirect_host,
+		),
+		Path(f"mobile/android/app/src/main/java/{package_path}/MainActivity.kt"): _main_activity_template(
+			package_id=package_id,
+			redirect_scheme=redirect_scheme,
+			redirect_host=redirect_host,
+		),
+	}
+
+	protected_files = {
+		Path(f"{app_name}/api/mobile_auth.py"): "Frappe Native",
+	}
+
+	created: list[str] = []
+	updated: list[str] = []
+	for relative_path, content in auth_files.items():
+		target_path = app_path / relative_path
+		target_path.parent.mkdir(parents=True, exist_ok=True)
+
+		if target_path.exists() and not force:
+			guard = protected_files.get(relative_path)
+			existing_text = _read_text(target_path)
+			if guard and guard not in existing_text:
+				raise click.ClickException(
+					f"Refusing to overwrite custom file without --force: {target_path}"
+				)
+
+		was_existing = target_path.exists()
+		target_path.write_text(content, encoding="utf-8")
+		(updated if was_existing else created).append(str(relative_path))
+
+	synced_files = _sync_mobile_web_source(app_path=app_path, android_root=android_root)
+
+	click.secho("Native auth scaffold completed.", fg="green")
+	click.echo(f"App: {app_name}")
+	click.echo(f"Site: {site}")
+	click.echo(f"Public URL: {public_base_url}")
+	click.echo(f"OAuth Client ID: {client_id}")
+	click.echo(f"Redirect URI: {redirect_uri}")
+	parsed_base_url = urlparse(public_base_url)
+	if parsed_base_url.hostname in {"localhost", "127.0.0.1"}:
+		click.secho(
+			"Note: localhost/127.0.0.1 is not reachable from a physical phone. Use --base-url with your LAN or public URL.",
+			fg=208,
+		)
+
+	if created:
+		click.echo("\nCreated files:")
+		for path in created:
+			click.echo(f"  + {path}")
+	if updated:
+		click.echo("\nUpdated files:")
+		for path in updated:
+			click.echo(f"  ~ {path}")
+	if synced_files:
+		click.echo("\nSynced mobile source files:")
+		for path in synced_files:
+			click.echo(f"  -> {path}")
+
+	click.echo("\nNext steps:")
+	click.echo(f"  bench native doctor --app {app_name} --target android")
+	click.echo(f"  bench native run --app {app_name} --target android --variant debug")
+	click.echo(f"  cat apps/{app_name}/docs/mobile-auth.md")
 
 
 @native.command("init", help="Scaffold Android MVP native project structure for a Frappe app.")
@@ -69,12 +211,16 @@ def init_native_project(
 
 	display_name = display_name or _titleize(app_name)
 	package_path = package_id.replace(".", "/")
+	redirect_scheme = _default_redirect_scheme(app_name)
+	redirect_host = "oauth-callback"
 
 	files_to_write = _get_android_mvp_templates(
 		app_name=app_name,
 		display_name=display_name,
 		package_id=package_id,
 		package_path=package_path,
+		redirect_scheme=redirect_scheme,
+		redirect_host=redirect_host,
 	)
 
 	created = []
@@ -122,6 +268,7 @@ def init_native_project(
 
 	click.echo("\nNext steps:")
 	click.echo(f"  bench native doctor --app {app_name} --target android")
+	click.echo(f"  bench native auth init --app {app_name} --site <your-site>")
 	click.echo(f"  bench native build --app {app_name} --target android --variant debug")
 	click.echo(f"  bench native run --app {app_name} --target android --variant debug")
 	click.echo(f"  cat apps/{app_name}/docs/mobile-quickstart.md")
@@ -1051,11 +1198,100 @@ def _is_valid_package_id(value: str) -> bool:
 	return bool(pattern.match(value))
 
 
+def _default_redirect_scheme(app_name: str) -> str:
+	slug = re.sub(r"[^a-z0-9]+", "-", app_name.lower()).strip("-")
+	slug = slug or "app"
+	return f"frappe-{slug}"
+
+
+def _normalize_base_url(value: str) -> str:
+	candidate = value.strip()
+	if not candidate:
+		raise click.ClickException("Base URL cannot be empty.")
+	if "://" not in candidate:
+		candidate = f"https://{candidate}"
+
+	parsed = urlparse(candidate)
+	if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+		raise click.ClickException(f"Invalid base URL: {value}")
+
+	return candidate.rstrip("/")
+
+
+def _resolve_site_base_url(site: str, site_path: Path, explicit_base_url: str | None = None) -> str:
+	if explicit_base_url:
+		return _normalize_base_url(explicit_base_url)
+
+	site_config_path = site_path / "site_config.json"
+	if site_config_path.exists():
+		try:
+			site_config = json.loads(site_config_path.read_text(encoding="utf-8"))
+			host_name = site_config.get("host_name")
+			if host_name:
+				return _normalize_base_url(str(host_name))
+		except Exception:
+			pass
+
+	def _get_url() -> str:
+		return frappe.utils.get_url()
+
+	try:
+		return _normalize_base_url(_run_in_site_context(site, _get_url))
+	except Exception:
+		return _normalize_base_url(f"https://{site}")
+
+
+def _run_in_site_context(site: str, fn):
+	frappe.init(site=site)
+	frappe.connect()
+	try:
+		return fn()
+	finally:
+		if getattr(frappe.local, "db", None):
+			frappe.db.close()
+		frappe.destroy()
+
+
+def _configure_oauth_client_for_site(
+	site: str,
+	app_name: str,
+	redirect_uri: str,
+	scope: str = "all openid",
+) -> dict[str, str]:
+	client_app_name = f"Frappe Native - {_titleize(app_name)}"
+
+	def _configure() -> dict[str, str]:
+		existing_name = frappe.db.get_value("OAuth Client", {"app_name": client_app_name}, "name")
+		oauth_client = frappe.get_doc("OAuth Client", existing_name) if existing_name else frappe.new_doc("OAuth Client")
+
+		oauth_client.app_name = client_app_name
+		oauth_client.scopes = scope
+		oauth_client.redirect_uris = redirect_uri
+		oauth_client.default_redirect_uri = redirect_uri
+		oauth_client.grant_type = "Authorization Code"
+		oauth_client.response_type = "Code"
+		oauth_client.skip_authorization = 1
+		oauth_client.set("allowed_roles", [])
+		oauth_client.save(ignore_permissions=True)
+		frappe.db.commit()
+
+		return {
+			"name": oauth_client.name,
+			"client_id": oauth_client.client_id or oauth_client.name,
+			"redirect_uri": redirect_uri,
+			"scope": scope,
+		}
+
+	return _run_in_site_context(site, _configure)
+
+
 def _get_android_mvp_templates(
 	app_name: str,
 	display_name: str,
 	package_id: str,
 	package_path: str,
+	redirect_scheme: str,
+	redirect_host: str,
 ) -> dict[Path, str]:
 	main_activity_path = Path(
 		f"mobile/android/app/src/main/java/{package_path}/MainActivity.kt"
@@ -1075,6 +1311,8 @@ def _get_android_mvp_templates(
 		Path("mobile/android/app/proguard-rules.pro"): _proguard_rules_template(),
 		Path("mobile/android/app/src/main/AndroidManifest.xml"): _manifest_template(
 			package_id=package_id,
+			redirect_scheme=redirect_scheme,
+			redirect_host=redirect_host,
 		),
 		Path("mobile/android/app/src/main/res/layout/activity_main.xml"): _activity_layout_template(),
 		Path("mobile/android/app/src/main/res/values/strings.xml"): _strings_template(
@@ -1083,7 +1321,11 @@ def _get_android_mvp_templates(
 		Path("mobile/app/index.html"): _standalone_index_template(display_name=display_name, app_name=app_name),
 		Path("mobile/app/styles.css"): _standalone_styles_template(),
 		Path("mobile/app/app.js"): _standalone_app_js_template(app_name=app_name),
-		main_activity_path: _main_activity_template(package_id=package_id),
+		main_activity_path: _main_activity_template(
+			package_id=package_id,
+			redirect_scheme=redirect_scheme,
+			redirect_host=redirect_host,
+		),
 		native_bridge_path: _native_bridge_template(package_id=package_id),
 		Path("mobile/shared/config/environments.json"): _environments_template(),
 		Path("mobile/shared/sdk/README.md"): _shared_sdk_readme_template(),
@@ -1221,7 +1463,7 @@ def _proguard_rules_template() -> str:
 """
 
 
-def _manifest_template(package_id: str) -> str:
+def _manifest_template(package_id: str, redirect_scheme: str, redirect_host: str) -> str:
 	return f"""<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 	<uses-permission android:name="android.permission.INTERNET" />
@@ -1235,11 +1477,18 @@ def _manifest_template(package_id: str) -> str:
 		android:theme="@style/Theme.MaterialComponents.DayNight.NoActionBar">
 		<activity
 			android:name="{package_id}.MainActivity"
+			android:launchMode="singleTask"
 			android:exported="true">
 			<intent-filter>
 				<action android:name="android.intent.action.MAIN" />
 
 				<category android:name="android.intent.category.LAUNCHER" />
+			</intent-filter>
+			<intent-filter>
+				<action android:name="android.intent.action.VIEW" />
+				<category android:name="android.intent.category.DEFAULT" />
+				<category android:name="android.intent.category.BROWSABLE" />
+				<data android:scheme="{redirect_scheme}" android:host="{redirect_host}" />
 			</intent-filter>
 		</activity>
 	</application>
@@ -1387,11 +1636,575 @@ def _standalone_app_js_template(app_name: str) -> str:
 """
 
 
-def _main_activity_template(package_id: str) -> str:
+def _auth_config_template(site_url: str, bootstrap_method: str, redirect_uri: str, scope: str) -> str:
+	return json.dumps(
+		{
+			"site_url": site_url,
+			"bootstrap_method": bootstrap_method,
+			"oauth": {
+				"redirect_uri": redirect_uri,
+				"scope": scope,
+			},
+		},
+		indent=2,
+	) + "\n"
+
+
+def _auth_index_template(display_name: str) -> str:
+	return f"""<!doctype html>
+<html lang="en">
+<head>
+	<meta charset="utf-8" />
+	<meta name="viewport" content="width=device-width, initial-scale=1" />
+	<title>{display_name}</title>
+	<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+	<main class="shell">
+		<section class="card" id="screen-landing">
+			<div class="badge">Frappe Native</div>
+			<h1>{display_name}</h1>
+			<p class="muted">Ship mobile apps from Bench with OAuth login, token refresh, and secure logout.</p>
+			<div class="actions">
+				<button class="btn btn-primary" id="btn-login" type="button">Login</button>
+			</div>
+		</section>
+
+		<section class="card hidden" id="screen-home">
+			<div class="badge badge-success">Authenticated</div>
+			<h2>Home</h2>
+			<p class="muted" id="user-line">Loading user...</p>
+			<p class="meta" id="site-line"></p>
+			<div class="actions">
+				<button class="btn btn-secondary" id="btn-logout" type="button">Logout</button>
+			</div>
+		</section>
+
+		<section class="status" id="status-line">Preparing app...</section>
+	</main>
+	<script src="./app.js"></script>
+</body>
+</html>
+"""
+
+
+def _auth_styles_template() -> str:
+	return """:root {
+	--bg: #0e1726;
+	--surface: #111d32;
+	--surface-soft: #14233d;
+	--text: #eaf1ff;
+	--muted: #a7b9d9;
+	--primary: #4d88ff;
+	--primary-pressed: #2f71ff;
+	--success: #16a34a;
+	--border: #243857;
+}
+* { box-sizing: border-box; }
+body {
+	margin: 0;
+	font-family: "Segoe UI", -apple-system, BlinkMacSystemFont, sans-serif;
+	background:
+		radial-gradient(circle at 20% 10%, rgba(77, 136, 255, 0.22), transparent 34%),
+		radial-gradient(circle at 80% 90%, rgba(22, 163, 74, 0.18), transparent 32%),
+		var(--bg);
+	color: var(--text);
+	min-height: 100vh;
+	display: grid;
+	place-items: center;
+	padding: 20px;
+}
+.shell {
+	width: min(560px, 100%);
+	display: grid;
+	gap: 14px;
+}
+.card {
+	background: linear-gradient(180deg, var(--surface) 0%, var(--surface-soft) 100%);
+	border: 1px solid var(--border);
+	border-radius: 18px;
+	padding: 24px;
+	box-shadow: 0 12px 36px rgba(3, 10, 24, 0.45);
+}
+.hidden {
+	display: none;
+}
+h1, h2 {
+	margin: 0 0 10px;
+	letter-spacing: -0.02em;
+}
+.muted {
+	margin: 0 0 16px;
+	color: var(--muted);
+	line-height: 1.55;
+}
+.meta {
+	margin: 0 0 16px;
+	color: #c9d8f5;
+	font-size: 14px;
+}
+.badge {
+	display: inline-block;
+	padding: 6px 10px;
+	border-radius: 999px;
+	font-size: 12px;
+	font-weight: 700;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	background: rgba(77, 136, 255, 0.2);
+	color: #91b4ff;
+	margin-bottom: 14px;
+}
+.badge-success {
+	background: rgba(22, 163, 74, 0.2);
+	color: #85f0ad;
+}
+.actions {
+	display: flex;
+	gap: 10px;
+}
+.btn {
+	appearance: none;
+	border: 1px solid transparent;
+	border-radius: 12px;
+	padding: 12px 16px;
+	font-size: 15px;
+	font-weight: 600;
+	cursor: pointer;
+	transition: transform 0.06s ease, background 0.2s ease;
+}
+.btn:active {
+	transform: translateY(1px);
+}
+.btn-primary {
+	background: var(--primary);
+	color: white;
+}
+.btn-primary:active {
+	background: var(--primary-pressed);
+}
+.btn-secondary {
+	background: transparent;
+	border-color: var(--border);
+	color: var(--text);
+}
+.status {
+	background: rgba(17, 29, 50, 0.9);
+	border: 1px solid var(--border);
+	border-radius: 12px;
+	padding: 10px 12px;
+	font-size: 13px;
+	color: var(--muted);
+}
+"""
+
+
+def _auth_app_js_template() -> str:
+	return """(function () {
+	"use strict";
+
+	const STORAGE_KEY = "frappe_native_tokens_v1";
+	const DRAFT_KEY = "frappe_native_login_draft_v1";
+
+	const els = {
+		landing: document.getElementById("screen-landing"),
+		home: document.getElementById("screen-home"),
+		status: document.getElementById("status-line"),
+		userLine: document.getElementById("user-line"),
+		siteLine: document.getElementById("site-line"),
+		loginBtn: document.getElementById("btn-login"),
+		logoutBtn: document.getElementById("btn-logout"),
+	};
+
+	let config = null;
+	let bootstrap = null;
+
+	async function main() {
+		try {
+			config = await loadConfig();
+			wireEvents();
+			setStatus("Ready");
+
+			await handleOAuthCallback();
+
+			const me = await getCurrentUser();
+			if (me) {
+				renderHome(me);
+			} else {
+				renderLanding();
+			}
+		} catch (error) {
+			setStatus(error.message || "Failed to initialize app");
+			renderLanding();
+		}
+	}
+
+	function wireEvents() {
+		if (els.loginBtn) {
+			els.loginBtn.addEventListener("click", startLogin);
+		}
+		if (els.logoutBtn) {
+			els.logoutBtn.addEventListener("click", logout);
+		}
+	}
+
+	async function loadConfig() {
+		const response = await fetch("./auth.config.json", { cache: "no-store" });
+		if (!response.ok) {
+			throw new Error("Missing auth.config.json");
+		}
+		return await response.json();
+	}
+
+	function setStatus(message) {
+		if (els.status) {
+			els.status.textContent = message;
+		}
+	}
+
+	function renderLanding() {
+		if (els.landing) els.landing.classList.remove("hidden");
+		if (els.home) els.home.classList.add("hidden");
+	}
+
+	function renderHome(user) {
+		if (els.home) els.home.classList.remove("hidden");
+		if (els.landing) els.landing.classList.add("hidden");
+		if (els.userLine) {
+			els.userLine.textContent = "Logged in as " + user;
+		}
+		if (els.siteLine) {
+			els.siteLine.textContent = "Site: " + config.site_url;
+		}
+	}
+
+	function unwrap(payload) {
+		if (payload && typeof payload === "object" && "message" in payload) {
+			return payload.message;
+		}
+		return payload;
+	}
+
+	function randomToken() {
+		const bytes = new Uint8Array(32);
+		crypto.getRandomValues(bytes);
+		return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
+	}
+
+	function getDraft() {
+		const raw = localStorage.getItem(DRAFT_KEY);
+		if (!raw) return null;
+		try {
+			return JSON.parse(raw);
+		} catch (error) {
+			return null;
+		}
+	}
+
+	function saveDraft(draft) {
+		localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+	}
+
+	function clearDraft() {
+		localStorage.removeItem(DRAFT_KEY);
+	}
+
+	function getTokens() {
+		const raw = localStorage.getItem(STORAGE_KEY);
+		if (!raw) return null;
+		try {
+			return JSON.parse(raw);
+		} catch (error) {
+			return null;
+		}
+	}
+
+	function saveTokens(tokenPayload) {
+		const expiresAt = Date.now() + (Number(tokenPayload.expires_in) || 0) * 1000;
+		const value = {
+			access_token: tokenPayload.access_token,
+			refresh_token: tokenPayload.refresh_token || null,
+			expires_at: expiresAt,
+		};
+		localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+	}
+
+	function clearTokens() {
+		localStorage.removeItem(STORAGE_KEY);
+	}
+
+	async function getBootstrap() {
+		if (bootstrap) return bootstrap;
+		const url = config.site_url + "/api/method/" + config.bootstrap_method;
+		const response = await fetch(url, { method: "GET" });
+		const payload = await response.json();
+		const message = unwrap(payload);
+		if (!message || !message.client_id) {
+			throw new Error("Bootstrap endpoint did not return client_id");
+		}
+		bootstrap = message;
+		return bootstrap;
+	}
+
+	async function startLogin() {
+		try {
+			setStatus("Preparing login...");
+			const info = await getBootstrap();
+			const state = randomToken();
+			const codeVerifier = randomToken();
+			saveDraft({ state, code_verifier: codeVerifier, created_at: Date.now() });
+
+			const redirectUri = info.redirect_uri || config.oauth.redirect_uri;
+			const scope = info.scope || config.oauth.scope || "all openid";
+			const params = new URLSearchParams({
+				client_id: info.client_id,
+				redirect_uri: redirectUri,
+				response_type: "code",
+				scope,
+				state,
+				code_challenge: codeVerifier,
+				code_challenge_method: "plain",
+			});
+			window.location.href =
+				config.site_url + "/api/method/frappe.integrations.oauth2.authorize?" + params.toString();
+		} catch (error) {
+			setStatus(error.message || "Failed to start login");
+		}
+	}
+
+	async function handleOAuthCallback() {
+		const current = new URL(window.location.href);
+		const code = current.searchParams.get("code");
+		const state = current.searchParams.get("state");
+		const error = current.searchParams.get("error");
+		const errorDescription = current.searchParams.get("error_description");
+
+		if (!code && !error) {
+			return;
+		}
+
+		if (error) {
+			setStatus("Login failed: " + (errorDescription || error));
+			clearAuthParams();
+			return;
+		}
+
+		const draft = getDraft();
+		if (!draft || draft.state !== state) {
+			setStatus("Login failed: state mismatch");
+			clearAuthParams();
+			clearDraft();
+			return;
+		}
+
+		const info = await getBootstrap();
+		const redirectUri = info.redirect_uri || config.oauth.redirect_uri;
+		const token = await exchangeCodeForToken({
+			client_id: info.client_id,
+			redirect_uri: redirectUri,
+			code,
+			code_verifier: draft.code_verifier,
+		});
+		saveTokens(token);
+		clearDraft();
+		clearAuthParams();
+		setStatus("Login successful");
+	}
+
+	function clearAuthParams() {
+		window.history.replaceState({}, "", "./index.html");
+	}
+
+	async function exchangeCodeForToken(payload) {
+		const body = new URLSearchParams({
+			grant_type: "authorization_code",
+			client_id: payload.client_id,
+			redirect_uri: payload.redirect_uri,
+			code: payload.code,
+			code_verifier: payload.code_verifier,
+		});
+
+		const response = await fetch(config.site_url + "/api/method/frappe.integrations.oauth2.get_token", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body,
+		});
+		const data = await response.json();
+		if (!response.ok || data.error || !data.access_token) {
+			throw new Error(data.error_description || data.error || "Token exchange failed");
+		}
+		return data;
+	}
+
+	async function refreshTokenIfNeeded(tokens) {
+		if (!tokens) return null;
+		const refreshWindowMs = 60 * 1000;
+		if (tokens.expires_at && Date.now() < tokens.expires_at - refreshWindowMs) {
+			return tokens;
+		}
+		if (!tokens.refresh_token) {
+			return null;
+		}
+
+		const info = await getBootstrap();
+		const body = new URLSearchParams({
+			grant_type: "refresh_token",
+			client_id: info.client_id,
+			refresh_token: tokens.refresh_token,
+		});
+		const response = await fetch(config.site_url + "/api/method/frappe.integrations.oauth2.get_token", {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body,
+		});
+		const data = await response.json();
+		if (!response.ok || data.error || !data.access_token) {
+			return null;
+		}
+		saveTokens(data);
+		return getTokens();
+	}
+
+	async function getCurrentUser() {
+		const tokens = await refreshTokenIfNeeded(getTokens());
+		if (!tokens || !tokens.access_token) {
+			clearTokens();
+			return null;
+		}
+
+		const response = await fetch(config.site_url + "/api/method/frappe.auth.get_logged_user", {
+			method: "GET",
+			headers: {
+				Authorization: "Bearer " + tokens.access_token,
+			},
+		});
+
+		if (response.status === 401 || response.status === 403) {
+			clearTokens();
+			return null;
+		}
+		if (!response.ok) {
+			setStatus("Failed to load session user");
+			return null;
+		}
+
+		const payload = await response.json();
+		const user = unwrap(payload);
+		if (!user || user === "Guest") {
+			return null;
+		}
+		return user;
+	}
+
+	async function revokeToken(token, tokenTypeHint) {
+		if (!token) return;
+		const body = new URLSearchParams({ token, token_type_hint: tokenTypeHint });
+		try {
+			await fetch(config.site_url + "/api/method/frappe.integrations.oauth2.revoke_token", {
+				method: "POST",
+				headers: { "Content-Type": "application/x-www-form-urlencoded" },
+				body,
+			});
+		} catch (error) {
+			// best effort
+		}
+	}
+
+	async function logout() {
+		const tokens = getTokens() || {};
+		await revokeToken(tokens.access_token, "access_token");
+		await revokeToken(tokens.refresh_token, "refresh_token");
+		clearTokens();
+		clearDraft();
+		setStatus("Logged out");
+		renderLanding();
+	}
+
+	main();
+})();
+"""
+
+
+def _mobile_auth_api_template(
+	app_name: str,
+	display_name: str,
+	client_id: str,
+	redirect_uri: str,
+	scope: str,
+) -> str:
+	return f'''"""
+Frappe Native mobile auth bootstrap for `{app_name}`.
+
+This file is generated by:
+	bench native auth init --app {app_name} --site <site>
+"""
+
+import frappe
+
+CLIENT_ID = "{client_id}"
+REDIRECT_URI = "{redirect_uri}"
+SCOPE = "{scope}"
+
+
+@frappe.whitelist(allow_guest=True)
+def get_client_id():
+	app_name = frappe.get_website_settings("app_name") or frappe.get_system_settings("app_name") or "{display_name}"
+	base_url = frappe.utils.get_url()
+	return {{
+		"client_id": CLIENT_ID,
+		"redirect_uri": REDIRECT_URI,
+		"scope": SCOPE,
+		"site_url": base_url,
+		"sitename": frappe.local.site,
+		"app_name": app_name,
+		"authorization_endpoint": f"{{base_url}}/api/method/frappe.integrations.oauth2.authorize",
+		"token_endpoint": f"{{base_url}}/api/method/frappe.integrations.oauth2.get_token",
+		"revoke_endpoint": f"{{base_url}}/api/method/frappe.integrations.oauth2.revoke_token",
+		"me_endpoint": f"{{base_url}}/api/method/frappe.auth.get_logged_user",
+	}}
+'''
+
+
+def _auth_quickstart_template(app_name: str, site: str, redirect_uri: str) -> str:
+	return f"""# Mobile Auth Quickstart
+
+This file was generated by:
+
+```bash
+bench native auth init --app {app_name} --site {site}
+```
+
+## Auth Flow Included
+
+- Landing screen with **Login** button
+- OAuth authorization code login with PKCE (plain challenge)
+- Access token + refresh token storage
+- Session user fetch (`frappe.auth.get_logged_user`)
+- Logout with token revocation
+
+## Files You Can Edit
+
+- `mobile/app/index.html`
+- `mobile/app/styles.css`
+- `mobile/app/app.js`
+- `mobile/app/auth.config.json`
+- `{app_name}/api/mobile_auth.py`
+
+## Redirect URI
+
+`{redirect_uri}`
+
+This URI is registered in OAuth Client and in Android deep-link intent filter.
+"""
+
+
+def _main_activity_template(package_id: str, redirect_scheme: str, redirect_host: str) -> str:
 	return f"""package {package_id}
 
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.graphics.Color
+import android.net.Uri
 import android.os.Bundle
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
@@ -1404,6 +2217,8 @@ import androidx.appcompat.app.AppCompatActivity
 class MainActivity : AppCompatActivity() {{
 	private lateinit var webView: WebView
 	private val startPage = "file:///android_asset/frappe_native/index.html"
+	private val oauthRedirectScheme = "{redirect_scheme}"
+	private val oauthRedirectHost = "{redirect_host}"
 
 	@SuppressLint("SetJavaScriptEnabled")
 	override fun onCreate(savedInstanceState: Bundle?) {{
@@ -1415,6 +2230,9 @@ class MainActivity : AppCompatActivity() {{
 		webView.settings.domStorageEnabled = true
 		webView.settings.mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
 		webView.settings.allowFileAccess = true
+		webView.settings.allowContentAccess = true
+		webView.settings.allowFileAccessFromFileURLs = true
+		webView.settings.allowUniversalAccessFromFileURLs = true
 		webView.setBackgroundColor(Color.WHITE)
 		webView.webViewClient = object : WebViewClient() {{
 			override fun onReceivedError(
@@ -1432,7 +2250,30 @@ class MainActivity : AppCompatActivity() {{
 		// Exposes Android-native methods to JS as `window.NativeBridge`.
 		webView.addJavascriptInterface(NativeBridge(this), "NativeBridge")
 
-		webView.loadUrl(startPage)
+		webView.loadUrl(resolveStartPage(intent))
+	}}
+
+	override fun onNewIntent(intent: Intent) {{
+		super.onNewIntent(intent)
+		setIntent(intent)
+		webView.loadUrl(resolveStartPage(intent))
+	}}
+
+	private fun resolveStartPage(incomingIntent: Intent?): String {{
+		val data: Uri = incomingIntent?.data ?: return startPage
+		val isOAuthCallback = data.scheme == oauthRedirectScheme && data.host == oauthRedirectHost
+		if (!isOAuthCallback) {{
+			return startPage
+		}}
+
+		val pageUri = Uri.parse(startPage).buildUpon()
+		data.getQueryParameter("code")?.let {{ pageUri.appendQueryParameter("code", it) }}
+		data.getQueryParameter("state")?.let {{ pageUri.appendQueryParameter("state", it) }}
+		data.getQueryParameter("error")?.let {{ pageUri.appendQueryParameter("error", it) }}
+		data.getQueryParameter("error_description")?.let {{
+			pageUri.appendQueryParameter("error_description", it)
+		}}
+		return pageUri.build().toString()
 	}}
 
 	private fun showErrorPage(message: String) {{
@@ -1586,13 +2427,19 @@ Optional supporting files:
 bench native doctor --app {app_name} --target android
 ```
 
-## 3) Build debug APK
+## 3) Enable auth scaffold (landing/login/home/logout)
+
+```bash
+bench native auth init --app {app_name} --site <your-site>
+```
+
+## 4) Build debug APK
 
 ```bash
 bench native build --app {app_name} --target android --variant debug
 ```
 
-## 4) Build + Install + Launch in one command
+## 5) Build + Install + Launch in one command
 
 ```bash
 bench native run --app {app_name} --target android --variant debug

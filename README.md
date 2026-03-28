@@ -8,6 +8,7 @@ Frappe Native provides Bench-powered scaffolding, environment checks, build, ins
 ## Ready Now
 
 - Create a native Android project instantly (`bench native init`)
+- Scaffold production-style OAuth mobile auth in one command (`bench native auth init`)
 - Verify your full environment in one command (`bench native doctor`)
 - Build installable APKs for debug or release (`bench native build`)
 - Build, install, and launch directly on device (`bench native run`)
@@ -40,6 +41,7 @@ Run from bench root:
 
 ```bash
 bench native init --app <your_app> --platform android
+bench native auth init --app <your_app> --site <your_site>
 bench native doctor --app <your_app> --target android
 bench native run --app <your_app> --target android --variant debug
 ```
@@ -51,6 +53,7 @@ This creates a standalone local source app:
 Optional files:
 - `apps/<your_app>/mobile/app/styles.css`
 - `apps/<your_app>/mobile/app/app.js`
+- `apps/<your_app>/mobile/app/auth.config.json`
 
 `bench native build` and `bench native run` automatically sync `mobile/app/*` into Android assets before compiling.
 
@@ -63,11 +66,15 @@ apps/<your_app>/
 │       └── mobile-v1.yaml
 ├── docs/
 │   └── mobile-quickstart.md
+├── <your_app>/
+│   └── api/
+│       └── mobile_auth.py
 └── mobile/
     ├── app/                              # edit here (your UI source)
     │   ├── index.html
     │   ├── styles.css
     │   └── app.js
+    │   └── auth.config.json
     ├── shared/
     │   ├── config/
     │   │   └── environments.json
@@ -102,6 +109,15 @@ Scaffold Android MVP project for an app.
 
 ```bash
 bench native init --app <your_app> --platform android [--force] [--package-id com.example.app] [--app-name "My App"]
+```
+
+### `bench native auth init`
+
+Create OAuth client on a site and scaffold landing/login/home/logout screens.
+
+```bash
+bench native auth init --app <your_app> --site <your_site>
+bench native auth init --app <your_app> --site <your_site> --base-url https://erp.example.com
 ```
 
 ### `bench native doctor`
