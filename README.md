@@ -53,7 +53,7 @@ This creates a standalone local source app:
 Optional files:
 - `apps/<your_app>/mobile/app/styles.css`
 - `apps/<your_app>/mobile/app/app.js`
-- `apps/<your_app>/mobile/app/auth.config.json`
+- `apps/<your_app>/mobile/app/auth.config.js`
 
 `bench native build` and `bench native run` automatically sync `mobile/app/*` into Android assets before compiling.
 
@@ -74,7 +74,7 @@ apps/<your_app>/
     │   ├── index.html
     │   ├── styles.css
     │   └── app.js
-    │   └── auth.config.json
+    │   └── auth.config.js
     ├── shared/
     │   ├── config/
     │   │   └── environments.json

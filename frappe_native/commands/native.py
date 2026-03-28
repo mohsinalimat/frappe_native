@@ -76,7 +76,7 @@ def init_native_auth(
 		Path("mobile/app/index.html"): _auth_index_template(display_name=display_name),
 		Path("mobile/app/styles.css"): _auth_styles_template(),
 		Path("mobile/app/app.js"): _auth_app_js_template(),
-		Path("mobile/app/auth.config.json"): _auth_config_template(
+		Path("mobile/app/auth.config.js"): _auth_config_js_template(
 			site_url=public_base_url,
 			bootstrap_method=f"{app_name}.api.mobile_auth.get_client_id",
 			redirect_uri=redirect_uri,
@@ -111,6 +111,7 @@ def init_native_auth(
 
 	created: list[str] = []
 	updated: list[str] = []
+	removed: list[str] = []
 	for relative_path, content in auth_files.items():
 		target_path = app_path / relative_path
 		target_path.parent.mkdir(parents=True, exist_ok=True)
@@ -126,6 +127,11 @@ def init_native_auth(
 		was_existing = target_path.exists()
 		target_path.write_text(content, encoding="utf-8")
 		(updated if was_existing else created).append(str(relative_path))
+
+	legacy_json = app_path / "mobile" / "app" / "auth.config.json"
+	if legacy_json.exists():
+		legacy_json.unlink()
+		removed.append("mobile/app/auth.config.json")
 
 	synced_files = _sync_mobile_web_source(app_path=app_path, android_root=android_root)
 
@@ -150,6 +156,10 @@ def init_native_auth(
 		click.echo("\nUpdated files:")
 		for path in updated:
 			click.echo(f"  ~ {path}")
+	if removed:
+		click.echo("\nRemoved files:")
+		for path in removed:
+			click.echo(f"  - {path}")
 	if synced_files:
 		click.echo("\nSynced mobile source files:")
 		for path in synced_files:
@@ -1791,18 +1801,20 @@ def _standalone_app_js_template(app_name: str) -> str:
 """
 
 
-def _auth_config_template(site_url: str, bootstrap_method: str, redirect_uri: str, scope: str) -> str:
-	return json.dumps(
-		{
-			"site_url": site_url,
-			"bootstrap_method": bootstrap_method,
-			"oauth": {
-				"redirect_uri": redirect_uri,
-				"scope": scope,
-			},
+def _auth_config_js_template(site_url: str, bootstrap_method: str, redirect_uri: str, scope: str) -> str:
+	config = {
+		"site_url": site_url,
+		"bootstrap_method": bootstrap_method,
+		"oauth": {
+			"redirect_uri": redirect_uri,
+			"scope": scope,
 		},
-		indent=2,
-	) + "\n"
+	}
+	return (
+		"window.FrappeNativeAuthConfig = "
+		+ json.dumps(config, indent=2)
+		+ ";\n"
+	)
 
 
 def _auth_index_template(display_name: str) -> str:
@@ -1837,6 +1849,7 @@ def _auth_index_template(display_name: str) -> str:
 
 		<section class="status" id="status-line">Preparing app...</section>
 	</main>
+	<script src="./auth.config.js"></script>
 	<script src="./app.js"></script>
 </body>
 </html>
@@ -2004,11 +2017,10 @@ def _auth_app_js_template() -> str:
 	}
 
 	async function loadConfig() {
-		const response = await fetch("./auth.config.json", { cache: "no-store" });
-		if (!response.ok) {
-			throw new Error("Missing auth.config.json");
+		if (window.FrappeNativeAuthConfig && typeof window.FrappeNativeAuthConfig === "object") {
+			return window.FrappeNativeAuthConfig;
 		}
-		return await response.json();
+		throw new Error("Missing auth.config.js (window.FrappeNativeAuthConfig)");
 	}
 
 	function setStatus(message) {
@@ -2342,7 +2354,7 @@ bench native auth init --app {app_name} --site {site}
 - `mobile/app/index.html`
 - `mobile/app/styles.css`
 - `mobile/app/app.js`
-- `mobile/app/auth.config.json`
+- `mobile/app/auth.config.js`
 - `{app_name}/api/mobile_auth.py`
 
 ## Redirect URI
