@@ -144,7 +144,13 @@ Build + install + launch (currently debug variant).
 
 ```bash
 bench native run --app <your_app> --target android --variant debug
+bench native run --app <your_app> --target android --variant debug --logs
+bench native run --app <your_app> --target android --variant debug --live --logs
 ```
+
+`--live` watches `mobile/app/*` and on change performs sync + rebuild + install + relaunch.
+`--logs` streams WebView `console.log(...)` output from `adb logcat`.
+This is live-rebuild (closer to hot restart), not Flutter's state-preserving hot reload.
 
 ## APK Output
 

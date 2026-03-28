@@ -6,6 +6,8 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -658,41 +660,42 @@ def build_native_project(
 	show_default=True,
 	help="Android build variant.",
 )
+@click.option("--live", is_flag=True, help="Watch mobile source and rebuild/install/relaunch on changes.")
+@click.option("--logs", is_flag=True, help="Stream WebView console logs from adb logcat.")
 @click.option("--json", "json_output", is_flag=True, help="Print machine-readable JSON output.")
 def run_native_project(
 	app_name: str,
 	target: str,
 	variant: str,
+	live: bool = False,
+	logs: bool = False,
 	json_output: bool = False,
 ):
 	if target != "android":
 		raise click.ClickException("Only Android run is supported right now.")
 	if variant != "debug":
 		raise click.ClickException("`bench native run` currently supports only --variant debug.")
+	if json_output and (live or logs):
+		raise click.ClickException("--json cannot be combined with --live or --logs.")
 
 	_, app_path, android_root = _resolve_android_paths(app_name)
-	gradle_task, apk_paths = _build_android_variant(
-		app_path=app_path, android_root=android_root, app_name=app_name, variant=variant, verbose=not json_output
-	)
-
-	if not apk_paths:
-		raise click.ClickException("Build succeeded but no APK was found to install/run.")
-
 	adb_path = _resolve_adb_path(android_root)
 	if adb_path is None:
 		raise click.ClickException("adb not found. Install Android SDK Platform-Tools and ensure adb is in PATH.")
-
-	install_ok, install_message = _install_apk(adb_path=adb_path, apk_path=apk_paths[0])
-	if not install_ok:
-		raise click.ClickException(install_message)
 
 	package_name = _resolve_package_name(android_root)
 	if not package_name:
 		raise click.ClickException("Could not determine applicationId for launching app.")
 
-	launch_ok, launch_message = _launch_app(adb_path=adb_path, package_name=package_name)
-	if not launch_ok:
-		raise click.ClickException(launch_message)
+	gradle_task, apk_path, install_message, launch_message = _run_once_install_and_launch(
+		app_name=app_name,
+		app_path=app_path,
+		android_root=android_root,
+		variant=variant,
+		adb_path=adb_path,
+		package_name=package_name,
+		verbose=not json_output,
+	)
 
 	if json_output:
 		click.echo(
@@ -703,7 +706,7 @@ def run_native_project(
 					"variant": variant,
 					"ok": True,
 					"task": gradle_task,
-					"apk_path": str(apk_paths[0]),
+					"apk_path": str(apk_path),
 					"package": package_name,
 					"install": install_message,
 					"launch": launch_message,
@@ -714,8 +717,66 @@ def run_native_project(
 		return
 
 	click.secho("Run completed successfully.", fg="green")
-	click.echo(f"APK installed: {apk_paths[0]}")
+	click.echo(f"APK installed: {apk_path}")
 	click.echo(f"Launched package: {package_name}")
+
+	logcat_process = None
+	logcat_thread = None
+	stop_logcat = threading.Event()
+	try:
+		if logs:
+			logcat_process, logcat_thread = _start_logcat_stream(
+				adb_path=adb_path, stop_event=stop_logcat, tag="FrappeNativeWebView"
+			)
+			click.echo("Streaming WebView console logs (Ctrl+C to stop)...")
+
+		if live:
+			click.echo(f"Live reload watching: {_mobile_source_root(app_path)}")
+			click.echo("On file change: sync -> build -> install -> relaunch")
+			click.echo("Press Ctrl+C to stop.")
+			previous = _snapshot_mobile_source(_mobile_source_root(app_path))
+			try:
+				while True:
+					time.sleep(1.0)
+					current = _snapshot_mobile_source(_mobile_source_root(app_path))
+					if current == previous:
+						continue
+
+					changed_files = _diff_mobile_snapshots(previous, current)
+					previous = current
+					changed_line = ", ".join(changed_files[:5])
+					if len(changed_files) > 5:
+						changed_line += f", +{len(changed_files) - 5} more"
+					click.echo(f"\nDetected changes: {changed_line}")
+
+					try:
+						_, rebuilt_apk, _, _ = _run_once_install_and_launch(
+							app_name=app_name,
+							app_path=app_path,
+							android_root=android_root,
+							variant=variant,
+							adb_path=adb_path,
+							package_name=package_name,
+							verbose=False,
+						)
+						click.secho(f"Reloaded successfully: {rebuilt_apk}", fg="green")
+					except click.ClickException as error:
+						click.secho(f"Reload failed: {error}", fg="red")
+			except KeyboardInterrupt:
+				click.echo("\nStopped live reload.")
+		elif logs:
+			try:
+				while True:
+					time.sleep(0.5)
+			except KeyboardInterrupt:
+				click.echo("\nStopped log streaming.")
+	finally:
+		if stop_logcat:
+			stop_logcat.set()
+		if logcat_process:
+			_stop_process(logcat_process)
+		if logcat_thread:
+			logcat_thread.join(timeout=2)
 
 
 def _add_check(
@@ -1066,6 +1127,100 @@ def _launch_app(adb_path: Path, package_name: str) -> tuple[bool, str]:
 	if proc.returncode != 0:
 		return False, output or f"Failed to launch package {package_name}"
 	return True, f"Launched package {package_name}"
+
+
+def _run_once_install_and_launch(
+	app_name: str,
+	app_path: Path,
+	android_root: Path,
+	variant: str,
+	adb_path: Path,
+	package_name: str,
+	verbose: bool = True,
+) -> tuple[str, Path, str, str]:
+	gradle_task, apk_paths = _build_android_variant(
+		app_path=app_path,
+		android_root=android_root,
+		app_name=app_name,
+		variant=variant,
+		verbose=verbose,
+	)
+	if not apk_paths:
+		raise click.ClickException("Build succeeded but no APK was found to install/run.")
+
+	install_ok, install_message = _install_apk(adb_path=adb_path, apk_path=apk_paths[0])
+	if not install_ok:
+		raise click.ClickException(install_message)
+
+	launch_ok, launch_message = _launch_app(adb_path=adb_path, package_name=package_name)
+	if not launch_ok:
+		raise click.ClickException(launch_message)
+
+	return gradle_task, apk_paths[0], install_message, launch_message
+
+
+def _snapshot_mobile_source(source_root: Path) -> dict[str, tuple[int, int]]:
+	if not source_root.exists():
+		return {}
+	snapshot: dict[str, tuple[int, int]] = {}
+	for path in sorted(source_root.rglob("*")):
+		if not path.is_file():
+			continue
+		relative = str(path.relative_to(source_root))
+		stat = path.stat()
+		snapshot[relative] = (stat.st_mtime_ns, stat.st_size)
+	return snapshot
+
+
+def _diff_mobile_snapshots(
+	before: dict[str, tuple[int, int]],
+	after: dict[str, tuple[int, int]],
+) -> list[str]:
+	keys = sorted(set(before) | set(after))
+	changed = [key for key in keys if before.get(key) != after.get(key)]
+	return changed or ["(unknown changes)"]
+
+
+def _start_logcat_stream(
+	adb_path: Path,
+	stop_event: threading.Event,
+	tag: str,
+) -> tuple[subprocess.Popen | None, threading.Thread | None]:
+	try:
+		proc = subprocess.Popen(
+			[str(adb_path), "logcat", f"{tag}:V", "*:S"],
+			stdout=subprocess.PIPE,
+			stderr=subprocess.STDOUT,
+			text=True,
+			bufsize=1,
+		)
+	except (subprocess.SubprocessError, OSError):
+		click.secho("Could not start logcat streaming.", fg=208)
+		return None, None
+
+	def _reader():
+		if proc.stdout is None:
+			return
+		for line in proc.stdout:
+			if stop_event.is_set():
+				break
+			text = line.rstrip()
+			if text:
+				click.echo(f"[web] {text}")
+
+	thread = threading.Thread(target=_reader, daemon=True)
+	thread.start()
+	return proc, thread
+
+
+def _stop_process(proc: subprocess.Popen) -> None:
+	if proc.poll() is not None:
+		return
+	proc.terminate()
+	try:
+		proc.wait(timeout=2)
+	except subprocess.TimeoutExpired:
+		proc.kill()
 
 
 def _get_gradle_wrapper_cmd(android_root: Path) -> list[str] | None:
@@ -2206,6 +2361,8 @@ import android.content.Intent
 import android.graphics.Color
 import android.net.Uri
 import android.os.Bundle
+import android.util.Log
+import android.webkit.ConsoleMessage
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -2245,7 +2402,15 @@ class MainActivity : AppCompatActivity() {{
 				}}
 			}}
 		}}
-		webView.webChromeClient = WebChromeClient()
+		webView.webChromeClient = object : WebChromeClient() {{
+			override fun onConsoleMessage(consoleMessage: ConsoleMessage): Boolean {{
+				val message = "[${{consoleMessage.messageLevel()}}] " +
+					"${{consoleMessage.message()}} " +
+					"(${{consoleMessage.sourceId()}}:${{consoleMessage.lineNumber()}})"
+				Log.d("FrappeNativeWebView", message)
+				return true
+			}}
+		}}
 
 		// Exposes Android-native methods to JS as `window.NativeBridge`.
 		webView.addJavascriptInterface(NativeBridge(this), "NativeBridge")
@@ -2443,6 +2608,8 @@ bench native build --app {app_name} --target android --variant debug
 
 ```bash
 bench native run --app {app_name} --target android --variant debug
+bench native run --app {app_name} --target android --variant debug --logs
+bench native run --app {app_name} --target android --variant debug --live --logs
 ```
 
 If you still prefer manual Gradle:
