@@ -2404,11 +2404,32 @@ class MainActivity : AppCompatActivity() {{
 		webView.settings.allowUniversalAccessFromFileURLs = true
 		webView.setBackgroundColor(Color.WHITE)
 		webView.webViewClient = object : WebViewClient() {{
+			override fun shouldOverrideUrlLoading(
+				view: WebView?,
+				request: WebResourceRequest?,
+			): Boolean {{
+				val target = request?.url ?: return false
+				val isOAuthCallback = target.scheme == oauthRedirectScheme && target.host == oauthRedirectHost
+				if (!isOAuthCallback) {{
+					return false
+				}}
+
+				startActivity(Intent(Intent.ACTION_VIEW, target))
+				return true
+			}}
+
 			override fun onReceivedError(
 				view: WebView?,
 				request: WebResourceRequest?,
 				error: WebResourceError?,
 			) {{
+				val target = request?.url
+				val isOAuthCallback = target?.scheme == oauthRedirectScheme && target.host == oauthRedirectHost
+				if (isOAuthCallback) {{
+					// oauth callback is expected to leave WebView and reopen activity with intent data.
+					return
+				}}
+
 				if (request?.isForMainFrame == true) {{
 					showErrorPage("WebView load error: ${{error?.description ?: "unknown"}}")
 				}}
