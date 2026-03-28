@@ -66,14 +66,11 @@ apps/<your_app>/
 │       └── mobile-v1.yaml
 ├── docs/
 │   └── mobile-quickstart.md
-├── <your_app>/
-│   └── api/
-│       └── mobile_auth.py
 └── mobile/
     ├── app/                              # edit here (your UI source)
     │   ├── index.html
     │   ├── styles.css
-    │   └── app.js
+    │   ├── app.js
     │   └── auth.config.js
     ├── shared/
     │   ├── config/
@@ -114,6 +111,7 @@ bench native init --app <your_app> --platform android [--force] [--package-id co
 ### `bench native auth init`
 
 Create OAuth client on a site and scaffold landing/login/home/logout screens.
+Bootstrap API is served from `frappe_native.api.mobile_auth.get_client_id?app=<your_app>`.
 
 ```bash
 bench native auth init --app <your_app> --site <your_site>
